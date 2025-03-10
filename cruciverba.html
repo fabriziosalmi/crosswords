@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang='it'>
+<head>
+  <meta charset='UTF-8'>
+  <title>Cruciverba</title>
+  <style>
+    table { border-collapse: collapse; margin-right: 20px; float: left; }
+    td { border: 1px solid black; width: 30px; height: 30px; text-align: center; font-size: 20px; font-family: sans-serif; }
+    .black { background-color: black; }
+    .input-cell { font-weight: bold; }
+    input { border: none; width: 28px; height: 28px; text-align: center; font-size: 20px; font-family: sans-serif; padding: 0; outline: none; }
+    input:focus { background-color: #e0e0e0; }
+  </style>
+</head>
+<body>
+  <h1>Cruciverba</h1>
+  <div style='display: flex;'>
+    <table>
+  <tr>
+    <td class='black'></td>
+    <td>1<input type='text' maxlength='1' oninput='this.value=this.value.toUpperCase()'></td>
+    <td>4<input type='text' maxlength='1' oninput='this.value=this.value.toUpperCase()'></td>
+  </tr>
+  <tr>
+    <td>5<input type='text' maxlength='1' oninput='this.value=this.value.toUpperCase()'></td>
+    <td><input type='text' maxlength='1' oninput='this.value=this.value.toUpperCase()'></td>
+    <td><input type='text' maxlength='1' oninput='this.value=this.value.toUpperCase()'></td>
+  </tr>
+  <tr>
+    <td>3<input type='text' maxlength='1' oninput='this.value=this.value.toUpperCase()'></td>
+    <td><input type='text' maxlength='1' oninput='this.value=this.value.toUpperCase()'></td>
+    <td><input type='text' maxlength='1' oninput='this.value=this.value.toUpperCase()'></td>
+  </tr>
+    </table>
+   <div style='float: left;'>
+     <h2>Definizioni</h2>
+     <h3>Orizzontali</h3>
+     <ul>
+       <li><b>1. FA</b> Dio en la cultura judía, que no es considerado un dios de los humanos sino un ser superior y omnipotente que creó</li>
+       <li><b>3. UNO</b> Número más pequeño utilizado en la contabilidad y juegos de cartas, equivalente a 1.</li>
+       <li><b>5. FIN</b> End, conclusion, or boundary (5 letters).</li>
+     </ul>
+     <h3>Verticali</h3>
+     <ul>
+       <li><b>4. ANO</b> Nave de dos palos, con una vela cuadrada.</li>
+       <li><b>2. FIN</b> End, culmine, término. (The end, the climax, the finale.)</li>
+       <li><b>6. FU</b> Crisp, fried dough pastry rolled into a cone shape and filled with sugar (5 letters).</li>
+     </ul>
+   </div>
+  </div>
+</body>
+</html>
