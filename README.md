@@ -2,6 +2,8 @@
 
 This Python script generates interactive crossword puzzles in HTML format. It leverages LangChain for definition generation and provides various options for grid creation, word selection, and output customization.
 
+- ## [Try the demo](https://fabriziosalmi.github.io/crosswords/)
+
 ## Features
 
 *   **Grid Generation:**
