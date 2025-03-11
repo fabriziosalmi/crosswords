@@ -19,7 +19,7 @@ from langchain_openai import ChatOpenAI
 from html_generator import create_html
 
 # --- Constants ---
-DEFAULT_GRID_WIDTH = 4
+DEFAULT_GRID_WIDTH = 3
 DEFAULT_GRID_HEIGHT = 3
 DEFAULT_BLACK_SQUARE_RATIO = 0.2
 DEFAULT_LM_STUDIO_URL = "http://localhost:1234/v1"
@@ -33,6 +33,8 @@ DEFAULT_LANGUAGE = "Italian"
 DEFAULT_MODEL = "meta-llama-3.1-8b-instruct"
 DEFAULT_MAX_GRID_ITERATIONS = 5
 MAX_RECURSION_DEPTH = 100  # Prevent stack overflow
+DEFAULT_BEAM_WIDTH = 3
+DEFAULT_MAX_BACKTRACK = 100
 
 # Setup logging
 logging.basicConfig(
@@ -518,6 +520,28 @@ def get_intersection_quality(
     
     return score
 
+class CrosswordStats:
+    def __init__(self):
+        self.attempts = 0
+        self.backtracks = 0
+        self.words_tried = 0
+        self.successful_placements = 0
+        self.failed_placements = 0
+        self.time_spent = 0
+        self.slot_fill_order = []
+        
+    def get_summary(self) -> str:
+        return f"""
+📊 Crossword Generation Stats:
+├─ Total Attempts: {self.attempts}
+├─ Backtracking Events: {self.backtracks}
+├─ Words Evaluated: {self.words_tried}
+├─ Successful Placements: {self.successful_placements}
+├─ Failed Placements: {self.failed_placements}
+├─ Success Rate: {(self.successful_placements/max(1,self.words_tried))*100:.1f}%
+└─ Time Spent: {self.time_spent:.2f}s
+"""
+
 def select_words_recursive(
     grid: List[List[str]],
     slots: List[Tuple[int, int, str, int]],
@@ -528,19 +552,25 @@ def select_words_recursive(
     timeout: int,
     progress: Progress,
     task: TaskID,
+    stats: CrosswordStats,
     recursion_depth: int = 0,
-    cache: Dict[str, bool] = None
+    cache: Dict[str, bool] = None,
+    beam_width: int = DEFAULT_BEAM_WIDTH,
 ) -> Tuple[Optional[List[List[str]]], Optional[List[Tuple[str, int, int, str]]]]:
-    """
-    Enhanced recursive word selection with caching and better heuristics.
-    """
+    """Enhanced recursive word selection with beam search and statistics."""
+    
     if cache is None:
         cache = {}
         
-    if time.time() - start_time > timeout:
+    stats.attempts += 1
+    current_time = time.time()
+    stats.time_spent = current_time - start_time
+    
+    if current_time - start_time > timeout:
         return None, None
 
     if recursion_depth > MAX_RECURSION_DEPTH:
+        stats.backtracks += 1
         return None, None
 
     if not slots:
@@ -548,66 +578,67 @@ def select_words_recursive(
             return grid, placed_words
         return None, None
 
-    # Forward checking and early exit
+    # Forward checking with early failure detection
     if not _validate_remaining_slots(grid, slots, words_by_length, cache):
+        stats.failed_placements += 1
         return None, None
 
-    # Select slot with fewest valid words (most constrained)
+    # Enhanced slot selection with intersection analysis
     slot_options = []
     for slot in slots:
         row, col, direction, length = slot
-        # Count valid words for this slot
         valid_count = sum(1 for word in words_by_length.get(length, [])
                          if _is_valid_cached(grid, word, row, col, direction, cache))
-        # Count intersections with placed words
-        slot_intersections = 0
-        for placed_word, p_row, p_col, p_dir in placed_words:
-            if direction == "across" and p_dir == "down":
-                if p_col >= col and p_col < col + length:
-                    if row >= p_row and row < p_row + len(placed_word):
-                        slot_intersections += 1
-            elif direction == "down" and p_dir == "across":
-                if p_row >= row and p_row < row + length:
-                    if col >= p_col and col < p_col + len(placed_word):
-                        slot_intersections += 1
         
-        slot_options.append((valid_count, -slot_intersections, slot))
-    
-    slot_options.sort()  # Sort by fewest options first
-    if not slot_options:
-        return None, None
-
-    _, _, best_slot = slot_options[0]
-    row, col, direction, length = best_slot
-    remaining_slots = [s for s in slots if s != best_slot]
-
-    # Get and score valid words
-    valid_words = [(word, calculate_word_score(word) + 
-                    get_intersection_quality(word, row, col, direction, placed_words))
-                   for word in words_by_length.get(length, [])
-                   if _is_valid_cached(grid, word, row, col, direction, cache)]
-    
-    # Sort by score descending
-    valid_words.sort(key=lambda x: x[1], reverse=True)
-    
-    # Try words in order of score
-    for word, _ in valid_words:
-        progress.update(task, advance=1)
-        new_grid = place_word(grid, word, row, col, direction)
-        new_placed_words = placed_words + [(word, row, col, direction)]
-
-        result = select_words_recursive(
-            new_grid, remaining_slots, words_by_length,
-            new_placed_words, max_attempts, start_time,
-            timeout, progress, task, recursion_depth + 1, cache
-        )
+        # Calculate intersection density
+        intersection_score = sum(1 for w in placed_words if _words_intersect((w[0], w[1], w[2], w[3]), 
+                                                                           ("", row, col, direction)))
         
-        if result[0] is not None:
-            return result
+        # Combined score for slot priority
+        priority_score = (valid_count + 1) * (intersection_score + 1)
+        slot_options.append((priority_score, valid_count, slot))
+    
+    slot_options.sort()  # Sort by priority score
+    
+    # Track slot fill order
+    stats.slot_fill_order.append((slot_options[0][2][0], slot_options[0][2][1], slot_options[0][2][2]))
+    
+    # Beam search - try multiple promising slots
+    beam_candidates = slot_options[:beam_width]
+    
+    for _, _, best_slot in beam_candidates:
+        row, col, direction, length = best_slot
+        remaining_slots = [s for s in slots if s != best_slot]
 
-        # Random restart on failure
-        if recursion_depth == 0 and random.random() < 0.1:
-            random.shuffle(valid_words)
+        # Score and sort valid words
+        valid_words = []
+        for word in words_by_length.get(length, []):
+            stats.words_tried += 1
+            if _is_valid_cached(grid, word, row, col, direction, cache):
+                score = calculate_word_score(word) + get_intersection_quality(word, row, col, direction, placed_words)
+                valid_words.append((word, score))
+
+        valid_words.sort(key=lambda x: x[1], reverse=True)
+        
+        # Try words with dynamic backtracking limit
+        backtrack_limit = min(len(valid_words), DEFAULT_MAX_BACKTRACK)
+        for word, _ in valid_words[:backtrack_limit]:
+            progress.update(task, advance=1)
+            new_grid = place_word(grid, word, row, col, direction)
+            new_placed_words = placed_words + [(word, row, col, direction)]
+            stats.successful_placements += 1
+
+            result = select_words_recursive(
+                new_grid, remaining_slots, words_by_length,
+                new_placed_words, max_attempts, start_time,
+                timeout, progress, task, stats,
+                recursion_depth + 1, cache, beam_width
+            )
+            
+            if result[0] is not None:
+                return result
+
+        stats.backtracks += 1
 
     return None, None
 
@@ -665,19 +696,17 @@ def select_words(
     task: TaskID,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> Tuple[Optional[List[List[str]]], Optional[List[Tuple[str, int, int, str]]]]:
-    """
-    Selects words to fill the grid (main logic).
-    """
+    """Enhanced word selection with statistics tracking."""
+    
+    stats = CrosswordStats()
+    start_time = time.time()
+    
     intersections = calculate_intersections(slots)
-
-    # Sort slots by combined heuristic (intersections and length)
     sorted_slots = sorted(
         slots,
         key=lambda x: (len(intersections.get(slots.index(x), [])), x[3]),
         reverse=True,
     )
-
-    start_time = time.time()
 
     total_estimated_attempts = sum(
         sum(1 for word in words_by_length.get(slot[3], [])
@@ -686,7 +715,7 @@ def select_words(
     )
     progress.update(task, total=total_estimated_attempts)
     
-    filled_grid, placed_words = select_words_recursive(  # Removed unused total_attempts from return value
+    filled_grid, placed_words = select_words_recursive(
         grid,
         sorted_slots,
         words_by_length,
@@ -696,10 +725,13 @@ def select_words(
         timeout,
         progress,
         task,
+        stats
     )
 
+    # Print statistics
+    logging.info(stats.get_summary())
+    
     return filled_grid, placed_words
-
 
 
 def main():
