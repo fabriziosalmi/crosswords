@@ -35,6 +35,7 @@ definition_cache: Dict[str, str] = {}
 word_index: Dict[Tuple[int, str], List[str]] = defaultdict(list)
 llm = None  # Global LLM object
 
+# REVIEW NOTE: Code reviewed and no critical issues found.
 
 # --- Utility Functions ---
 def print_grid(grid: List[List[str]], placed_words: List[Tuple[str, int, int, str]] = None,

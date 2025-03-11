@@ -1,30 +1,30 @@
 # config.py
 
 # --- Constants ---
-DEFAULT_GRID_WIDTH = 5
-DEFAULT_GRID_HEIGHT = 5
-DEFAULT_MAX_GRID_ITERATIONS = 100  # Added from main()
+DEFAULT_GRID_WIDTH = 5  # Default grid size
+DEFAULT_GRID_HEIGHT = 5     # Default grid size
+DEFAULT_MAX_GRID_ITERATIONS = 1000  # Added from main()
 DEFAULT_BLACK_SQUARE_RATIO = 0.2  # Classic NYT ratio
-DEFAULT_LM_STUDIO_URL = "http://localhost:1234/v1"
+DEFAULT_LM_STUDIO_URL = "http://localhost:1234/v1"  # LLM Studio URL
 DEFAULT_WORDS_FILE = "data/parole.txt"  # Replace with your word list
-DEFAULT_OUTPUT_FILENAME = "docs/cruciverba.html"
-DEFAULT_MAX_ATTEMPTS = 100  # Attempts per word placement
+DEFAULT_OUTPUT_FILENAME = "docs/cruciverba.html"        # Output filename
+DEFAULT_MAX_ATTEMPTS = 1000  # Attempts per word placement
 DEFAULT_TIMEOUT = 180  # Overall timeout (seconds)
-DEFAULT_LLM_TIMEOUT = 30
-DEFAULT_LLM_MAX_TOKENS = 64
+DEFAULT_LLM_TIMEOUT = 30    # Timeout for LLM
+DEFAULT_LLM_MAX_TOKENS = 64     # Maximum tokens for LLM
 DEFAULT_LANGUAGE = "Italian"  # Or whichever language
 DEFAULT_MODEL = "meta-llama-3.1-8b-instruct"  # A good, general-purpose open model
 MAX_RECURSION_DEPTH = 1000  # Safety net
-DEFAULT_BEAM_WIDTH = 10
-DEFAULT_MAX_BACKTRACK = 300
+DEFAULT_BEAM_WIDTH = 1000   # Beam width for search
+DEFAULT_MAX_BACKTRACK = 3000    # Maximum number of backtracks
 MIN_WORD_LENGTH = 3  # More standard minimum length
 FORBIDDEN_PATTERNS = [
     r'\b{}\b',  # Whole word
     r'{}'.format,  # Substring
     r'(?i){}'.format,  # Case-insensitive
 ]
-MAX_DEFINITION_ATTEMPTS = 3
-DEFINITION_RETRY_DELAY = 2
+MAX_DEFINITION_ATTEMPTS = 3     # Maximum attempts to get a definition
+DEFINITION_RETRY_DELAY = 2      # Delay between definition attempts
 DEFAULT_DIFFICULTY = "easy"  # easy, medium, hard
 WORD_FREQUENCY_WEIGHTS = {
     "easy": 0.8,
