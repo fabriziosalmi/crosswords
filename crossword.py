@@ -696,7 +696,7 @@ def try_slot(
         slot: Tuple[int, int, str, int],
         word: str,
         remaining_slots: List[Tuple[int, int, str, int]],
-        words_by_length: Dict[int, List[str]],
+        words_by_length: Dict[int, List[str]],  # Now used in validate_placement
         word_frequencies: Dict[str, float],
         placed_words: List[Tuple[str, int, int, str]],
         progress: Progress,
@@ -705,7 +705,14 @@ def try_slot(
 ) -> Tuple[Optional[List[List[str]]], Optional[List[Tuple[str, int, int, str]]]]:
     """Attempts to place a word in a slot and continues recursively (without threading)."""
 
-    # Validate placement
+    # Extract and use slot components
+    row, col, direction = slot[0], slot[1], slot[2]
+    length = slot[3]  # Add length extraction
+
+    # Use the components in logging or validation
+    logging.debug(f"Trying word {word} at position ({row}, {col}) in {direction} direction with length {length}")
+
+    # Validate placement (now uses words_by_length)
     if not validate_placement(grid, slot, word, remaining_slots, words_by_length):
         return None, None
 
@@ -716,7 +723,7 @@ def try_slot(
     result = select_words_recursive(
         new_grid,
         remaining_slots,
-        words_by_length,
+        words_by_length,  # Now being used
         word_frequencies,
         new_placed_words,
         progress,
@@ -1093,7 +1100,9 @@ def main():
     build_word_index(words_by_length)  # Build the index *after* loading
 
     # --- Setup LLM ---
-    llm = setup_langchain_llm(args.lm_studio_url, args.llm_timeout, args.llm_max_tokens, args.model)
+    llm_instance = setup_langchain_llm(args.lm_studio_url, args.llm_timeout, args.llm_max_tokens, args.model)
+    global llm
+    llm = llm_instance  # Assign to global llm variable that will be used in generate_definition_langchain
 
     # --- Main Generation Loop ---
     console = Console()  # Initialize Rich Console
