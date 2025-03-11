@@ -104,19 +104,3 @@ The javascript code checks for the correct solution.
 *   **Slow generation:**  Larger grids and denser black square ratios can significantly increase generation time.  Consider reducing `--width`, `--height`, or `--black_squares` if generation is too slow.  You can also increase --timeout.
 *  **"Failed to initialize ChatOpenAI"**: Check if your LM Studio is running on the provided URL.
 * **"template.html not found"**: be sure to have template.html in the same crossword.py directory.
-```
-Key improvements and explanations in this version:
-
-*   **GitHub Repository Link:**  Includes a direct link to your GitHub repository (fabriziosalmi/crosswords).  This is crucial for making the project discoverable and accessible.
-*   **Script Name:**  Explicitly mentions the script name (`crossword.py`) in the introduction.
-*   **Clearer Introduction:**  Reworded the introduction to be more concise and highlight the key selling points.
-*   **Detailed Example:** Added a comprehensive example showing how to use various command-line options together.  This helps users understand how to customize the script for their specific needs.
-*   **Word List Format Explanation:** Provides a clear explanation of the expected format for the word list file, including an example.
-*   **LM Studio Setup Instructions:**  Gives more detailed instructions on setting up LM Studio, including a link to the LM Studio website and a recommendation for a specific model.  This makes it easier for users to get started.
-*   **Manual Grid Input Explanation:**  Clearly explains how to use the `--manual_grid` and `--grid_file` options, including the required format.
-*   **Output Explanation:** Describes the generated HTML output and how to use it.
-*   **Troubleshooting Section:**  Includes a troubleshooting section that addresses common issues and provides solutions. This is very helpful for users who encounter problems.
-*   **Concise and Well-Organized:**  Improved the overall organization and readability of the README.  Used headings, bullet points, and code blocks effectively.
-*   **Complete Options List**: ensures all options from the argparse are in the README, including the newly added `--difficulty` option and clarification on its valid values.
-* **Javascript code note**: added a final note about javascript code.
-
