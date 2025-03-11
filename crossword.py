@@ -7,7 +7,6 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple, Dict, Optional
-
 from rich.progress import Progress, TaskID
 
 # --- LangChain Imports ---
@@ -15,6 +14,9 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 from langchain_openai import ChatOpenAI
+
+# --- Local Imports ---
+from html_generator import create_html
 
 # --- Constants ---
 DEFAULT_GRID_WIDTH = 4
@@ -59,7 +61,7 @@ def setup_langchain_llm(
         llm = ChatOpenAI(
             base_url=lm_studio_url,
             api_key="NA",  # API key is not needed for local models
-            model="deephermes-3-llama-3-8b-preview",  # Or other compatible
+            model="meta-llama-3.1-8b-instruct",  # Or other compatible
             temperature=0.7,
             max_tokens=llm_max_tokens,
             timeout=llm_timeout,
@@ -453,6 +455,63 @@ def calculate_intersections(
     return intersections
 
 
+def calculate_word_score(word: str) -> float:
+    """Calculate word score based on letter frequencies and uniqueness."""
+    # Common letters get lower scores to encourage more intersections
+    common_letters = 'EARIOTNSLC'
+    uncommon_letters = 'JQXZWYVKBP'
+    
+    score = 0.0
+    for letter in word:
+        if letter in common_letters:
+            score += 0.5
+        elif letter in uncommon_letters:
+            score += 2.0
+        else:
+            score += 1.0
+            
+    # Bonus for words with diverse letters
+    unique_letters = len(set(word))
+    score += unique_letters * 0.5
+    
+    return score
+
+def get_intersection_quality(
+    word: str,
+    row: int,
+    col: int,
+    direction: str,
+    placed_words: List[Tuple[str, int, int, str]]
+) -> float:
+    """Calculate how well a word intersects with existing words."""
+    score = 0.0
+    length = len(word)
+    
+    for placed_word, p_row, p_col, p_dir in placed_words:
+        if direction == "across" and p_dir == "down":
+            if p_col >= col and p_col < col + length:
+                if row >= p_row and row < p_row + len(placed_word):
+                    # Reward intersections that use less common letters
+                    intersection_letter = word[p_col - col]
+                    if intersection_letter in 'JQXZW':
+                        score += 3.0
+                    elif intersection_letter in 'YVKBP':
+                        score += 2.0
+                    else:
+                        score += 1.0
+        elif direction == "down" and p_dir == "across":
+            if p_row >= row and p_row < row + length:
+                if col >= p_col and col < p_col + len(placed_word):
+                    intersection_letter = word[p_row - row]
+                    if intersection_letter in 'JQXZW':
+                        score += 3.0
+                    elif intersection_letter in 'YVKBP':
+                        score += 2.0
+                    else:
+                        score += 1.0
+    
+    return score
+
 def select_words_recursive(
     grid: List[List[str]],
     slots: List[Tuple[int, int, str, int]],
@@ -464,10 +523,14 @@ def select_words_recursive(
     progress: Progress,
     task: TaskID,
     recursion_depth: int = 0,
+    cache: Dict[str, bool] = None
 ) -> Tuple[Optional[List[List[str]]], Optional[List[Tuple[str, int, int, str]]]]:
     """
-    Recursively selects words with improved constraint checking.
+    Enhanced recursive word selection with caching and better heuristics.
     """
+    if cache is None:
+        cache = {}
+        
     if time.time() - start_time > timeout:
         return None, None
 
@@ -479,112 +542,113 @@ def select_words_recursive(
             return grid, placed_words
         return None, None
 
-    # --- Early Exit with Constraint Check ---
-    intersections = calculate_intersections(slots)
+    # Forward checking and early exit
+    if not _validate_remaining_slots(grid, slots, words_by_length, cache):
+        return None, None
+
+    # Select slot with fewest valid words (most constrained)
+    slot_options = []
     for slot in slots:
         row, col, direction, length = slot
-        # Build letter constraints for this slot
-        letter_constraints = [set(string.ascii_uppercase) for _ in range(length)]
-        
-        # Check existing letters in grid
-        for i in range(length):
-            if direction == "across":
-                if grid[row][col + i] != ".":
-                    letter_constraints[i] = {grid[row][col + i]}
-            else:  # down
-                if grid[row + i][col] != ".":
-                    letter_constraints[i] = {grid[row + i][col]}
-        
-        # Check intersections with placed words
-        for word, p_row, p_col, p_dir in placed_words:
+        # Count valid words for this slot
+        valid_count = sum(1 for word in words_by_length.get(length, [])
+                         if _is_valid_cached(grid, word, row, col, direction, cache))
+        # Count intersections with placed words
+        slot_intersections = 0
+        for placed_word, p_row, p_col, p_dir in placed_words:
             if direction == "across" and p_dir == "down":
-                if p_col >= col and p_col < col + length and row >= p_row and row < p_row + len(word):
-                    idx = p_col - col
-                    letter = word[row - p_row]
-                    letter_constraints[idx] &= {letter}
+                if p_col >= col and p_col < col + length:
+                    if row >= p_row and row < p_row + len(placed_word):
+                        slot_intersections += 1
             elif direction == "down" and p_dir == "across":
-                if p_row >= row and p_row < row + length and col >= p_col and col < p_col + len(word):
-                    idx = p_row - row
-                    letter = word[col - p_col]
-                    letter_constraints[idx] &= {letter}
-
-        # Check if any valid words exist for these constraints
-        possible_words = words_by_length.get(length, [])
-        valid_words = [word for word in possible_words if all(
-            word[i] in letter_constraints[i] for i in range(length)
-        ) and is_valid_placement(grid, word, row, col, direction)]
+                if p_row >= row and p_row < row + length:
+                    if col >= p_col and col < p_col + len(placed_word):
+                        slot_intersections += 1
         
-        if not valid_words:
-            return None, None
+        slot_options.append((valid_count, -slot_intersections, slot))
+    
+    slot_options.sort()  # Sort by fewest options first
+    if not slot_options:
+        return None, None
 
-    # --- Select Most Constrained Slot ---
-    def slot_score(slot):
-        idx = slots.index(slot)
-        num_intersections = len(intersections[idx])
-        row, col, direction, length = slot
-        fixed_letters = sum(1 for i in range(length) if 
-            (grid[row][col + i] != "." if direction == "across" 
-             else grid[row + i][col] != "."))
-        valid_word_count = sum(1 for word in words_by_length.get(length, []) 
-            if is_valid_placement(grid, word, row, col, direction))
-        return (num_intersections + fixed_letters) / (valid_word_count + 1)
-
-    best_slot = max(slots, key=slot_score)
+    _, _, best_slot = slot_options[0]
     row, col, direction, length = best_slot
     remaining_slots = [s for s in slots if s != best_slot]
 
-    # --- Get Valid Words with Constraints ---
-    letter_constraints = [set(string.ascii_uppercase) for _ in range(length)]
+    # Get and score valid words
+    valid_words = [(word, calculate_word_score(word) + 
+                    get_intersection_quality(word, row, col, direction, placed_words))
+                   for word in words_by_length.get(length, [])
+                   if _is_valid_cached(grid, word, row, col, direction, cache)]
     
-    # Apply grid constraints
-    for i in range(length):
-        if direction == "across":
-            if grid[row][col + i] != ".":
-                letter_constraints[i] = {grid[row][col + i]}
-        else:  # down
-            if grid[row + i][col] != ".":
-                letter_constraints[i] = {grid[row + i][col]}
-
-    # Apply intersection constraints
-    for word, p_row, p_col, p_dir in placed_words:
-        if direction == "across" and p_dir == "down":
-            if p_col >= col and p_col < col + length and row >= p_row and row < p_row + len(word):
-                letter_constraints[p_col - col] &= {word[row - p_row]}
-        elif direction == "down" and p_dir == "across":
-            if p_row >= row and p_row < row + length and col >= p_col and col < p_col + len(word):
-                letter_constraints[p_row - row] &= {word[col - p_col]}
-
-    # Filter words based on constraints
-    possible_words = words_by_length.get(length, [])
-    valid_words = [
-        word for word in possible_words
-        if all(word[i] in letter_constraints[i] for i in range(length))
-        and is_valid_placement(grid, word, row, col, direction)
-    ]
-
-    random.shuffle(valid_words)  # Randomize to avoid getting stuck
-
-    for word in valid_words:
+    # Sort by score descending
+    valid_words.sort(key=lambda x: x[1], reverse=True)
+    
+    # Try words in order of score
+    for word, _ in valid_words:
         progress.update(task, advance=1)
         new_grid = place_word(grid, word, row, col, direction)
         new_placed_words = placed_words + [(word, row, col, direction)]
 
-        result_grid, result_placed = select_words_recursive(
-            new_grid,
-            remaining_slots,
-            words_by_length,
-            new_placed_words,
-            max_attempts,
-            start_time,
-            timeout,
-            progress,
-            task,
-            recursion_depth + 1,
+        result = select_words_recursive(
+            new_grid, remaining_slots, words_by_length,
+            new_placed_words, max_attempts, start_time,
+            timeout, progress, task, recursion_depth + 1, cache
         )
-        if result_grid:
-            return result_grid, result_placed
+        
+        if result[0] is not None:
+            return result
+
+        # Random restart on failure
+        if recursion_depth == 0 and random.random() < 0.1:
+            random.shuffle(valid_words)
 
     return None, None
+
+def _is_valid_cached(
+    grid: List[List[str]], 
+    word: str,
+    row: int,
+    col: int,
+    direction: str,
+    cache: Dict[str, bool]
+) -> bool:
+    """Cached version of is_valid_placement."""
+    key = f"{word}:{row}:{col}:{direction}"
+    if key not in cache:
+        cache[key] = is_valid_placement(grid, word, row, col, direction)
+    return cache[key]
+
+def _validate_remaining_slots(
+    grid: List[List[str]],
+    slots: List[Tuple[int, int, str, int]],
+    words_by_length: Dict[int, List[str]],
+    cache: Dict[str, bool]
+) -> bool:
+    """Forward checking - ensure all slots have at least one valid word."""
+    for row, col, direction, length in slots:
+        if not any(_is_valid_cached(grid, word, row, col, direction, cache)
+                  for word in words_by_length.get(length, [])):
+            return False
+    return True
+
+def _words_intersect(
+    word1: Tuple[str, int, int, str],
+    word2: Tuple[str, int, int, str]
+) -> bool:
+    """Check if two word placements intersect."""
+    _, row1, col1, dir1 = word1
+    _, row2, col2, dir2 = word2
+    
+    if dir1 == dir2:
+        return False
+        
+    if dir1 == "across":
+        return (col2 >= col1 and col2 < col1 + len(word1[0]) and
+                row1 >= row2 and row1 < row2 + len(word2[0]))
+    else:
+        return (row2 >= row1 and row2 < row1 + len(word1[0]) and
+                col1 >= col2 and col1 < col2 + len(word2[0]))
 
 
 def select_words(
@@ -629,193 +693,6 @@ def select_words(
     )
 
     return filled_grid, placed_words
-
-
-def create_html(
-    grid: List[List[str]],
-    placed_words: List[Tuple[str, int, int, str]],
-    definitions: Dict[str, Dict[int, str]],
-    filename: str,
-):
-    """Generates the HTML for the interactive crossword."""
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write("<!DOCTYPE html>\n")
-        f.write("<html lang='it'>\n")
-        f.write("<head>\n")
-        f.write("  <meta charset='UTF-8'>\n")
-        f.write("  <meta name='viewport' content='width=device-width, initial-scale=1.0'>\n")
-        f.write("  <title>Cruciverba</title>\n")
-        f.write("  <style>\n")
-        f.write(
-            "    body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin: 20px; }\n"
-        )
-        f.write("    h1 { text-align: center; }\n")
-        f.write(
-            "    .crossword-container { display: flex; flex-direction: column; align-items: center; width: 100%; max-width: 600px; }\n"
-        )
-        f.write(
-            "    table { border-collapse: collapse; margin-bottom: 20px; }\n"
-        )
-        f.write(
-            "    td { border: 1px solid black; width: 30px; height: 30px; text-align: center; font-size: 20px; position: relative; }\n"
-        )
-        f.write("    .black { background-color: black; }\n")
-        f.write(
-            "    input { box-sizing: border-box; border: none; width: 100%; height: 100%; text-align: center; font-size: 20px; padding: 0; outline: none; background-color: transparent; }\n"
-        )  # Fill cell, transparent
-        f.write(
-            "    input:focus { background-color: #e0e0e0; }\n"
-        )  # Highlight
-        f.write(
-            "    .number { position: absolute; top: 2px; left: 2px; font-size: 8px; }\n"
-        )
-        f.write(
-            "    .definitions-container { width: 100%; max-width: 600px; }\n"
-        )
-        f.write("    .definitions { margin-top: 1em; }\n")
-        f.write("    h2, h3 { text-align: center; }\n")
-        f.write("    ul { list-style-type: none; padding: 0; }\n")
-        f.write("    li { margin-bottom: 0.5em; }\n")
-        f.write("  </style>\n")
-
-        # --- JavaScript ---
-        f.write("  <script>\n")
-        f.write("    function navigateCells(event) {\n")
-        f.write("      const input = event.target;\n")
-        f.write(
-            "      const maxLength = parseInt(input.getAttribute('maxlength'), 10);\n"
-        )
-        f.write("      if (input.value.length >= maxLength) {\n")
-        f.write("        const currentRow = input.parentElement.parentElement;\n")
-        f.write(
-            "        const currentCellIndex = Array.from(currentRow.children).indexOf(input.parentElement);\n"
-        )
-        f.write("        const nextCell = currentRow.children[currentCellIndex + 1];\n")
-        f.write("        if (nextCell) {\n")
-        f.write("          const nextInput = nextCell.querySelector('input');\n")
-        f.write("          if (nextInput) {\n")
-        f.write("            nextInput.focus();\n")
-        f.write("          }\n")
-        f.write("        } else {\n")
-        f.write("          const nextRow = currentRow.nextElementSibling;\n")
-        f.write("          if (nextRow) {\n")
-        f.write(
-            "          const nextRowFirstCell = nextRow.children[currentCellIndex];\n"
-        )
-        f.write("              if (nextRowFirstCell) {\n")
-        f.write(
-            "                  const nextInput = nextRowFirstCell.querySelector('input');\n"
-        )
-        f.write("                  if(nextInput) { nextInput.focus(); } \n")
-        f.write("              }\n")
-        f.write("          }\n")
-        f.write("        }\n")
-        f.write("      }\n")
-        # Handle arrow keys
-        f.write("      switch (event.key) {\n")
-        f.write("        case 'ArrowUp':\n")
-        f.write("        case 'Up':\n")
-        f.write("          moveFocus(-1, 0, input);\n")
-        f.write("          break;\n")
-        f.write("        case 'ArrowDown':\n")
-        f.write("        case 'Down':\n")
-        f.write("          moveFocus(1, 0, input);\n")
-        f.write("          break;\n")
-        f.write("        case 'ArrowLeft':\n")
-        f.write("        case 'Left':\n")
-        f.write("          moveFocus(0, -1, input);\n")
-        f.write("          break;\n")
-        f.write("        case 'ArrowRight':\n")
-        f.write("        case 'Right':\n")
-        f.write("          moveFocus(0, 1, input);\n")
-        f.write("          break;\n")
-        f.write("      }\n")
-        f.write("    }\n")
-
-        f.write("    function moveFocus(rowDelta, colDelta, currentInput) {\n")
-        f.write("        const currentRow = currentInput.parentElement.parentElement;\n")
-        f.write(
-            "        const currentCellIndex = Array.from(currentRow.children).indexOf(currentInput.parentElement);\n"
-        )
-        f.write(
-            "        const allRows = Array.from(currentRow.parentElement.children);\n"
-        )
-        f.write("        const currentRowIndex = allRows.indexOf(currentRow);\n")
-        f.write("        const nextRowIndex = currentRowIndex + rowDelta;\n")
-        f.write("        if (nextRowIndex >= 0 && nextRowIndex < allRows.length) {\n")
-        f.write("            const nextRow = allRows[nextRowIndex];\n")
-        f.write("            const nextCellIndex = currentCellIndex + colDelta;\n")
-        f.write(
-            "            if (nextCellIndex >= 0 && nextCellIndex < nextRow.children.length) {\n"
-        )
-        f.write("                const nextCell = nextRow.children[nextCellIndex];\n")
-        f.write("                const nextInput = nextCell.querySelector('input');\n")
-        f.write("                if (nextInput) {\n")
-        f.write("                    nextInput.focus();\n")
-        f.write("                }\n")
-        f.write("            }\n")
-        f.write("        }\n")
-        f.write("    }\n")
-        f.write("  </script>\n")
-
-        f.write("</head>\n")
-        f.write("<body>\n")
-        f.write("  <h1>Cruciverba</h1>\n")
-        f.write("  <div class='crossword-container'>\n")
-        f.write("    <table>\n")
-
-        # Create numbering map
-        cell_numbers: Dict[Tuple[int, int, str], int] = {}
-        next_number = 1
-        for word, row, col, direction in placed_words:
-            if (row, col, direction) not in cell_numbers:
-                cell_numbers[(row, col, direction)] = next_number
-                next_number += 1
-
-        # Write table
-        for r, row in enumerate(grid):
-            f.write("  <tr>\n")
-            for c, cell in enumerate(row):
-                if cell == "#":
-                    f.write("    <td class='black'></td>\n")
-                else:
-                    cell_number_html = ""
-                    for (word_row, word_col, word_dir), num in cell_numbers.items():
-                        if word_row == r and word_col == c:
-                            cell_number_html = (
-                                f"<span class='number'>{num}</span>"
-                            )
-                            break
-                    f.write(
-                        f"    <td>{cell_number_html}<input type='text' maxlength='1' oninput='this.value=this.value.toUpperCase(); navigateCells(event);'></td>\n"
-                    )
-            f.write("  </tr>\n")
-        f.write("    </table>\n")
-
-        f.write("  </div>\n")
-
-        # Definitions
-        f.write("  <div class='definitions-container'>\n")
-        f.write("     <h2>Definizioni</h2>\n")
-
-        f.write("     <div class='definitions'>\n")
-        f.write("     <h3>Orizzontali</h3>\n")
-        f.write("     <ul>\n")
-        for key, definition in definitions["across"].items():
-            f.write(f"       <li><b>{key}</b> {definition}</li>\n")
-        f.write("     </ul>\n")
-        f.write("     </div>\n")
-
-        f.write("     <div class='definitions'>\n")
-        f.write("     <h3>Verticali</h3>\n")
-        f.write("     <ul>\n")
-        for key, definition in definitions["down"].items():
-            f.write(f"       <li><b>{key}</b> {definition}</li>\n")
-        f.write("     </ul>\n")
-        f.write("     </div>\n")
-        f.write("  </div>\n")
-        f.write("</body>\n")
-        f.write("</html>\n")
 
 
 
