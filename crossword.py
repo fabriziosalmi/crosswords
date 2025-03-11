@@ -19,20 +19,20 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_openai import ChatOpenAI
 
 # --- Constants (Moved to top for clarity and easy modification) ---
-DEFAULT_GRID_WIDTH = 5
-DEFAULT_GRID_HEIGHT = 5
-DEFAULT_BLACK_SQUARE_RATIO = 0.23  # Adjusted for a more reasonable default
+DEFAULT_GRID_WIDTH = 4
+DEFAULT_GRID_HEIGHT = 4
+DEFAULT_BLACK_SQUARE_RATIO = 0.2 # Adjusted for a more reasonable default
 DEFAULT_LM_STUDIO_URL = "http://localhost:1234/v1"
 DEFAULT_WORDS_FILE = "data/parole.txt"
 DEFAULT_OUTPUT_FILENAME = "docs/cruciverba.html"
-DEFAULT_MAX_ATTEMPTS = 1000  # Per word placement
+DEFAULT_MAX_ATTEMPTS = 10000  # Per word placement
 DEFAULT_TIMEOUT = 180  # Overall timeout
 DEFAULT_LLM_TIMEOUT = 30
 DEFAULT_LLM_MAX_TOKENS = 64  # increased for better definition quality
 DEFAULT_LANGUAGE = "Italian"
 DEFAULT_MODEL = "meta-llama-3.1-8b-instruct"  # Changed to a reliable open model
 MAX_RECURSION_DEPTH = 1000  # Increased, but still a safety net
-DEFAULT_BEAM_WIDTH = 50  # Slightly increased
+DEFAULT_BEAM_WIDTH = 100  # Slightly increased
 DEFAULT_MAX_BACKTRACK = 3000  # Increased
 MIN_WORD_LENGTH = 2  # Increased minimum word length
 FORBIDDEN_PATTERNS = [
@@ -74,6 +74,9 @@ placement_cache: Dict[str, bool] = {}
 definition_cache: Dict[str, str] = {}
 # Pre-processed word index (global, for efficient access)
 word_index: Dict[Tuple[int, str], List[str]] = defaultdict(list)
+# Global LLM object
+llm = None
+
 
 
 # --- Utility Functions ---
@@ -188,6 +191,7 @@ def build_word_index(words_by_length: Dict[int, List[str]]):
 
 def setup_langchain_llm(lm_studio_url: str, llm_timeout: int, llm_max_tokens: int, model: str) -> ChatOpenAI:
     """Sets up the LangChain LLM with retries, timeout, and error handling."""
+    global llm # Use the global llm object
     try:
         llm = ChatOpenAI(
             base_url=lm_studio_url,
@@ -197,14 +201,14 @@ def setup_langchain_llm(lm_studio_url: str, llm_timeout: int, llm_max_tokens: in
             max_tokens=llm_max_tokens,
             timeout=llm_timeout,
         )
-        return llm
+        return llm # Return is useful even if we set the global
     except Exception as e:
         logging.error(f"Failed to initialize ChatOpenAI: {e}")
         sys.exit(1)
 
 
 @lru_cache(maxsize=512)  # Memoize definition generation
-def generate_definition_langchain(llm: ChatOpenAI, word: str, language: str) -> str:
+def generate_definition_langchain(word: str, language: str) -> str:
     """Generates a crossword clue using LangChain, with retries and improved filtering."""
     if word in definition_cache:
         return definition_cache[word]
@@ -223,7 +227,7 @@ def generate_definition_langchain(llm: ChatOpenAI, word: str, language: str) -> 
     chain = (
             {"word": RunnablePassthrough(), "language": RunnablePassthrough()}
             | prompt
-            | llm
+            | llm # Use the global llm
             | output_parser
     )
 
@@ -333,6 +337,17 @@ def generate_grid_random(width: int, height: int, black_square_ratio: float) -> 
                     (row < height - 1 and col < width - 1 and grid[row + 1][col] == "#" and grid[row][col + 1] == "#" and
                      grid[row + 1][col + 1] == "#"):
                 continue  # Skip this placement to avoid 2x2 block
+
+            # Check for isolated white squares
+            def is_isolated(r, c):
+                if r > 0 and grid[r-1][c] == ".": return False
+                if r < height - 1 and grid[r+1][c] == ".": return False
+                if c > 0 and grid[r][c-1] == ".": return False
+                if c < width - 1 and grid[r][c+1] == ".": return False
+                return True
+
+            if is_isolated(row, col):
+                continue
 
             place_symmetrically(row, col)
             placed_count += 2 if (row, col) != (height - 1 - row, width - 1 - col) else 1
@@ -905,7 +920,7 @@ def order_cell_numbers(slots: List[Tuple[int, int, str, int]]) -> Dict[Tuple[int
     return cell_numbers
 
 
-def generate_definitions(placed_words: List[Tuple[str, int, int, str]], llm: ChatOpenAI, language: str) -> Dict[
+def generate_definitions(placed_words: List[Tuple[str, int, int, str]], language: str) -> Dict[
     str, Dict[int, str]]:
     """Generates definitions for placed words, with proper numbering."""
     definitions = {"across": {}, "down": {}}
@@ -919,8 +934,8 @@ def generate_definitions(placed_words: List[Tuple[str, int, int, str]], llm: Cha
         with ThreadPoolExecutor() as executor:
             futures = []
             for word, row, col, direction in placed_words:
-                future = executor.submit(generate_definition_langchain, llm, word, language)
-                futures.append((future, word, row, col, direction))  # Store all data for easier processing
+                future = executor.submit(generate_definition_langchain, word, language)
+                futures.append((future, word, row, col, direction))  # Store all data
 
             for future, word, row, col, direction in futures:
                 try:
@@ -939,7 +954,7 @@ def create_html(grid: List[List[str]], placed_words: List[Tuple[str, int, int, s
                 definitions: Dict[str, Dict[int, str]], output_filename: str):
     """Generates the interactive HTML file for the crossword."""
     try:
-        with open("template.html", "r", encoding="utf-8") as template_file:  # Load from external file
+        with open("template.html", "r", encoding="utf-8") as template_file:
             template = template_file.read()
 
         # Create grid HTML
@@ -1108,7 +1123,7 @@ def main():
             console.print("[green]Crossword filled successfully![/]")
             print_grid(filled_grid, placed_words, console)
 
-            definitions = generate_definitions(placed_words, llm, args.language)
+            definitions = generate_definitions(placed_words, args.language) # Pass only necessary arguments
             create_html(filled_grid, placed_words, definitions, args.output_filename)
             console.print(f"[green]Crossword puzzle saved to: {args.output_filename}[/]")
             console.print(stats.get_summary())  # Show stats
