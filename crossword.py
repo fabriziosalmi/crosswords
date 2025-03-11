@@ -4,7 +4,7 @@ import random
 import re
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple, Dict, Optional
 from threading import Lock
 from functools import lru_cache
@@ -19,9 +19,9 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_openai import ChatOpenAI
 
 # --- Constants (Moved to top for clarity and easy modification) ---
-DEFAULT_GRID_WIDTH = 15
-DEFAULT_GRID_HEIGHT = 15
-DEFAULT_BLACK_SQUARE_RATIO = 0.17  # Adjusted for a more reasonable default
+DEFAULT_GRID_WIDTH = 5
+DEFAULT_GRID_HEIGHT = 5
+DEFAULT_BLACK_SQUARE_RATIO = 0.23  # Adjusted for a more reasonable default
 DEFAULT_LM_STUDIO_URL = "http://localhost:1234/v1"
 DEFAULT_WORDS_FILE = "data/parole.txt"
 DEFAULT_OUTPUT_FILENAME = "docs/cruciverba.html"
@@ -30,7 +30,7 @@ DEFAULT_TIMEOUT = 180  # Overall timeout
 DEFAULT_LLM_TIMEOUT = 30
 DEFAULT_LLM_MAX_TOKENS = 64 #increased for better definition quality
 DEFAULT_LANGUAGE = "Italian"
-DEFAULT_MODEL = "mistralai/Mistral-7B-Instruct-v0.1"  # Changed to a reliable open model
+DEFAULT_MODEL = "meta-llama-3.1-8b-instruct"  # Changed to a reliable open model
 MAX_RECURSION_DEPTH = 1000  # Increased, but still a safety net
 DEFAULT_BEAM_WIDTH = 10   # Slightly increased
 DEFAULT_MAX_BACKTRACK = 300 # Increased
@@ -44,7 +44,7 @@ MAX_DEFINITION_ATTEMPTS = 3  # Retry definition generation
 DEFINITION_RETRY_DELAY = 2  # Seconds between definition retries
 
 # First, add new constants for difficulty settings
-DEFAULT_DIFFICULTY = "medium"  # Options: easy, medium, hard
+DEFAULT_DIFFICULTY = "easy"  # Options: easy, medium, hard
 WORD_FREQUENCY_WEIGHTS = {
     "easy": 0.8,     # Prefer common words
     "medium": 0.5,   # Balanced
@@ -57,7 +57,7 @@ MIN_WORD_COUNTS = {
 }
 
 # Add this constant near the top with other constants
-MAX_THREAD_POOL_SIZE = 16  # Limit maximum number of threads
+MAX_THREAD_POOL_SIZE = 8  # Limit maximum number of threads
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -402,14 +402,21 @@ def check_all_letters_connected(grid: List[List[str]], placed_words: List[Tuple[
     if not placed_words:
         return True
 
+    # Find all letter positions and verify letters in grid
     letter_positions = set()
     for word, row, col, direction in placed_words:
         for i in range(len(word)):
             if direction == "across":
-                letter_positions.add((row, col + i))
+                pos = (row, col + i)
+                if grid[row][col + i] != word[i]:  # Verify grid letter matches word
+                    return False
             else:
-                letter_positions.add((row + i, col))
+                pos = (row + i, col)
+                if grid[row + i][col] != word[i]:  # Verify grid letter matches word
+                    return False
+            letter_positions.add(pos)
 
+    # Check if each letter is connected
     for row, col in letter_positions:
         in_across = any(
             row == r and col >= c and col < c + len(w)
@@ -420,9 +427,9 @@ def check_all_letters_connected(grid: List[List[str]], placed_words: List[Tuple[
             for w, r, c, d in placed_words if d == "down"
         )
         if not (in_across and in_down):
-            return False  # Letter not part of both across and down words
+            return False
 
-    return True  # All letters connected
+    return True
 
 def _validate_remaining_slots(grid: List[List[str]], slots: List[Tuple[int, int, str, int]], words_by_length: Dict[int, List[str]]) -> bool:
     """Checks if, for all remaining slots, at least one valid word exists (forward checking)."""
@@ -431,28 +438,53 @@ def _validate_remaining_slots(grid: List[List[str]], slots: List[Tuple[int, int,
             return False  # No valid words for this slot
     return True
 
-def calculate_intersection_score(grid:List[List[str]], word:str, row:int, col:int, direction:str, placed_words: List[Tuple[str, int, int, str]]) -> float:
-    """Calculates an intersection score, rewarding more intersections and rarer letters."""
-
+def calculate_intersection_score(grid: List[List[str]], word: str, row: int, col: int, direction: str, placed_words: List[Tuple[str, int, int, str]]) -> float:
+    """Calculates an intersection score based on grid state and placed words."""
     intersections = 0
     score = 0.0
     length = len(word)
 
+    # Check current grid state
+    grid_state = [row[:] for row in grid]
+    
+    # Place the new word temporarily
+    for i, letter in enumerate(word):
+        if direction == "across":
+            if grid_state[row][col + i] != '.' and grid_state[row][col + i] != letter:
+                return -1.0  # Invalid placement
+            grid_state[row][col + i] = letter
+        else:
+            if grid_state[row + i][col] != '.' and grid_state[row + i][col] != letter:
+                return -1.0  # Invalid placement
+            grid_state[row + i][col] = letter
+
+    # Calculate intersections with placed words
     for placed_word, p_row, p_col, p_dir in placed_words:
         if direction == "across" and p_dir == "down":
-            if p_col >= col and p_col < col + length:  # Potential intersection
+            if p_col >= col and p_col < col + length:
                 if row >= p_row and row < p_row + len(placed_word):
-                    intersections +=1
+                    intersections += 1
                     score += 1
         elif direction == "down" and p_dir == "across":
-            if p_row >= row and p_row < row+length:
+            if p_row >= row and p_row < row + length:
                 if col >= p_col and col < p_col + len(placed_word):
                     intersections += 1
-                    score +=1
+                    score += 1
 
-    return score + intersections * 0.5 # intersections have additional score
+    return score + intersections * 0.5
 
+def process_slot(slots: List[Tuple[int, int, str, int]], sorted_slots: List[Tuple[int, int, str, int]], row: int, col: int, direction: int, length: int) -> None:
+    """Process a slot with its components."""
+    slot = (row, col, direction, length)
+    if slot not in slots:
+        sorted_slots.append(slot)
 
+def process_placement(slots: List[Tuple[int, int, str, int]], sorted_slots: List[Tuple[int, int, str, int]], row: int, col: int, direction: str) -> None:
+    """Process a placement in the grid."""
+    if (row, col, direction) not in [(s[0], s[1], s[2]) for s in slots]:
+        length = 0  # Initialize length for new slot
+        current_slot = (row, col, direction, length)
+        sorted_slots.append(current_slot)
 
 def get_slot_score(
     grid: List[List[str]],

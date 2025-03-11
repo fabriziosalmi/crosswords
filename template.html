@@ -1,9 +1,10 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
     <title>Crossword Puzzle</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
-        /* Add your CSS styles here */
         .crossword-grid {
             border-collapse: collapse;
         }
@@ -27,8 +28,8 @@
           border: none;
           background-color: transparent;
           text-transform: uppercase;
-          font-size: 20px; /* Adjust as needed */
-          padding: 0; /* Remove default padding */
+          font-size: 20px;
+          padding: 0;
         }
         .number{
             position: absolute;
@@ -47,6 +48,20 @@
         .clue-number{
             font-weight: bold;
         }
+
+        /* Mobile Responsiveness */
+        @media (max-width: 600px) {
+            .crossword-grid td {
+                width: 20px;
+                height: 20px;
+            }
+            .letter {
+                font-size: 16px;
+            }
+            .number {
+                font-size: 8px;
+            }
+        }
     </style>
 </head>
 <body>
@@ -54,9 +69,17 @@
     {grid_html}
     {definitions_html}
 
-     <script>
-    // Add JavaScript for interactivity here (handling input, checking answers, etc.)
+    <button id="clearButton">Clear Grid</button>
+
+    <script>
     const inputs = document.querySelectorAll('.letter');
+    const clearButton = document.getElementById('clearButton');
+
+    clearButton.addEventListener('click', () => {
+        inputs.forEach(input => {
+            input.value = '';
+        });
+    });
 
     inputs.forEach(input => {
         input.addEventListener('input', (event) => {
@@ -64,17 +87,16 @@
             let nextCell = null;
 
             if (cell.value.length >= cell.maxLength) {
-                // Move to the next cell in the same direction
                 const row = parseInt(cell.dataset.row);
                 const col = parseInt(cell.dataset.col);
                 const direction = cell.dataset.direction;
 
                 if (direction === 'across') {
                     nextCell = document.querySelector(`.letter[data-row="${row}"][data-col="${col + 1}"][data-direction="${direction}"]`);
-                } else { // down
+                } else {
                     nextCell = document.querySelector(`.letter[data-row="${row + 1}"][data-col="${col}"][data-direction="${direction}"]`);
                 }
-                 if (!nextCell) { //check if it is the last letter of the word
+                 if (!nextCell) {
                     const currentId = cell.closest('.white').id
                     const [wordRow, wordCol, wordDir] = currentId.split("-")
 
@@ -98,13 +120,13 @@
             const direction = cell.dataset.direction;
 
             if (event.key === 'Backspace' || event.key === 'Delete') {
-                  if (cell.value.length === 0) { //Go back only if it's empty
+                  if (cell.value.length === 0) {
                         if (direction === 'across') {
                             prevCell = document.querySelector(`.letter[data-row="${row}"][data-col="${col - 1}"][data-direction="${direction}"]`);
-                        } else { // down
+                        } else {
                             prevCell = document.querySelector(`.letter[data-row="${row - 1}"][data-col="${col}"][data-direction="${direction}"]`);
                         }
-                         if (!prevCell) { //check if it is the first letter of the word
+                         if (!prevCell) {
                                 const currentId = cell.closest('.white').id
                                 const [wordRow, wordCol, wordDir] = currentId.split("-")
 
@@ -120,8 +142,13 @@
                     }
             }
         });
-    });
 
+        input.addEventListener('keypress', (event) => {
+            if (!/^[a-zA-Z]$/.test(event.key)) {
+                event.preventDefault();
+            }
+        });
+    });
     </script>
 </body>
 </html>
