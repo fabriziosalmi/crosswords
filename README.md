@@ -202,12 +202,4 @@ Contributions are welcome!  Here are some ways you can contribute:
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details. (You'll need to create a LICENSE file and put the MIT license text in it.)
-```
-
-Key improvements and explanations in this extended version:
-
-*   **More Detailed Troubleshooting:**  Expanded the troubleshooting section to cover more potential issues and provide more specific solutions.  This includes addressing problems with grid generation failures, LLM issues, and manual grid input errors.
-*   **Clearer Output Description:**  Provides a more precise description of the contents of the generated HTML file.
-*   **Contribution Guidelines:** Added a "Contributing" section, encouraging contributions and outlining how users can report bugs, suggest features, and submit pull requests.  This is crucial for open-source projects.
-*   **License Information:**  Includes a "License" section, specifying the MIT License (which is a very common and permissive open-source license).  **You'll need to create a file named `LICENSE` in your project's root directory and paste the text of the MIT license into it.**  You can find the MIT license text easily online (e.g., on the [Open Source Initiative website](https://opensource.org/licenses/MIT)).
 
