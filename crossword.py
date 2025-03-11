@@ -18,7 +18,7 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_openai import ChatOpenAI
 
 # --- Import config ---
-from config import Config, DEFAULT_BEAM_WIDTH, DEFAULT_MAX_BACKTRACK, DEFAULT_GRID_WIDTH, DEFAULT_GRID_HEIGHT, DEFAULT_BLACK_SQUARE_RATIO, DEFAULT_LM_STUDIO_URL, DEFAULT_WORDS_FILE, DEFAULT_OUTPUT_FILENAME, DEFAULT_MAX_ATTEMPTS, DEFAULT_TIMEOUT, DEFAULT_LLM_TIMEOUT, DEFAULT_LLM_MAX_TOKENS, DEFAULT_LANGUAGE, DEFAULT_MODEL, DEFAULT_DIFFICULTY  # Import the Config class
+from config import Config, DEFAULT_BEAM_WIDTH, DEFAULT_MAX_BACKTRACK, DEFAULT_GRID_WIDTH, DEFAULT_GRID_HEIGHT, DEFAULT_BLACK_SQUARE_RATIO, DEFAULT_LM_STUDIO_URL, DEFAULT_WORDS_FILE, DEFAULT_OUTPUT_FILENAME, DEFAULT_MAX_ATTEMPTS, DEFAULT_TIMEOUT, DEFAULT_LLM_TIMEOUT, DEFAULT_LLM_MAX_TOKENS, DEFAULT_LANGUAGE, DEFAULT_MODEL, DEFAULT_DIFFICULTY, DEFAULT_MAX_GRID_ITERATIONS  # Import the Config class
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -842,7 +842,7 @@ def main():
     parser.add_argument("--llm_max_tokens", type=int, default=DEFAULT_LLM_MAX_TOKENS)
     parser.add_argument("--language", type=str, default=DEFAULT_LANGUAGE)
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
-    parser.add_argument("--max_grid_iterations", type=int, default=5)
+    parser.add_argument("--max_grid_iterations", type=int, default=DEFAULT_MAX_GRID_ITERATIONS)
     parser.add_argument("--difficulty", type=str, default=DEFAULT_DIFFICULTY, choices=["easy", "medium", "hard"])
 
     args = parser.parse_args()
