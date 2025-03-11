@@ -2,79 +2,154 @@ import argparse
 import logging
 import random
 import re
-import string
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
 from typing import List, Tuple, Dict, Optional
+from threading import Lock
+from functools import lru_cache
+from collections import defaultdict
+import nltk  # For word frequency
 from rich.progress import Progress, TaskID
-
-# --- LangChain Imports ---
+from rich.console import Console
+from rich.table import Table
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 from langchain_openai import ChatOpenAI
 
-# --- Local Imports ---
-from html_generator import create_html
-
-# --- Constants ---
-DEFAULT_GRID_WIDTH = 3
-DEFAULT_GRID_HEIGHT = 3
-DEFAULT_BLACK_SQUARE_RATIO = 0.3
+# --- Constants (Moved to top for clarity and easy modification) ---
+DEFAULT_GRID_WIDTH = 15
+DEFAULT_GRID_HEIGHT = 15
+DEFAULT_BLACK_SQUARE_RATIO = 0.17  # Adjusted for a more reasonable default
 DEFAULT_LM_STUDIO_URL = "http://localhost:1234/v1"
 DEFAULT_WORDS_FILE = "data/parole.txt"
 DEFAULT_OUTPUT_FILENAME = "docs/cruciverba.html"
-DEFAULT_MAX_ATTEMPTS = 50
-DEFAULT_TIMEOUT = 120
+DEFAULT_MAX_ATTEMPTS = 100  # Per word placement
+DEFAULT_TIMEOUT = 180  # Overall timeout
 DEFAULT_LLM_TIMEOUT = 30
-DEFAULT_LLM_MAX_TOKENS = 48
+DEFAULT_LLM_MAX_TOKENS = 64 #increased for better definition quality
 DEFAULT_LANGUAGE = "Italian"
-DEFAULT_MODEL = "meta-llama-3.1-8b-instruct"
-DEFAULT_MAX_GRID_ITERATIONS = 5
-MAX_RECURSION_DEPTH = 100  # Prevent stack overflow
-DEFAULT_BEAM_WIDTH = 5
-DEFAULT_MAX_BACKTRACK = 200
-MIN_WORD_LENGTH = 2
+DEFAULT_MODEL = "mistralai/Mistral-7B-Instruct-v0.1"  # Changed to a reliable open model
+MAX_RECURSION_DEPTH = 1000  # Increased, but still a safety net
+DEFAULT_BEAM_WIDTH = 10   # Slightly increased
+DEFAULT_MAX_BACKTRACK = 300 # Increased
+MIN_WORD_LENGTH = 2      # Increased minimum word length
 FORBIDDEN_PATTERNS = [
-    r'\b{}\b',  # Exact word match
-    r'{}'.format,  # Direct word usage
-    r'(?i){}'.format,  # Case insensitive match
+    r'\b{}\b',
+    r'{}'.format,
+    r'(?i){}'.format,
 ]
+MAX_DEFINITION_ATTEMPTS = 3  # Retry definition generation
+DEFINITION_RETRY_DELAY = 2  # Seconds between definition retries
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+# First, add new constants for difficulty settings
+DEFAULT_DIFFICULTY = "medium"  # Options: easy, medium, hard
+WORD_FREQUENCY_WEIGHTS = {
+    "easy": 0.8,     # Prefer common words
+    "medium": 0.5,   # Balanced
+    "hard": 0.2      # Prefer rare words
+}
+MIN_WORD_COUNTS = {
+    "easy": 30,
+    "medium": 40,
+    "hard": 50
+}
 
-# Compile regex patterns
+# Add this constant near the top with other constants
+MAX_THREAD_POOL_SIZE = 16  # Limit maximum number of threads
+
+# --- Logging Setup ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# --- Compiled Regex Patterns ---
 WORD_CLEAN_RE = re.compile(r"[^A-Z]")
 DEFINITION_CLEAN_RE = re.compile(r"^\d+\.\s*")
 NON_ALPHANUMERIC_RE = re.compile(r"^[^\w]+|[^\w]+$")
 
+# --- Global Variables ---
+# Use a thread-safe cache
+cache_lock = Lock()
+placement_cache: Dict[str, bool] = {}
+definition_cache: Dict[str, str] = {}
 
-def setup_langchain_llm(
-    lm_studio_url: str, 
-    llm_timeout: int, 
-    llm_max_tokens: int,
-    model: str
-) -> ChatOpenAI:
-    """
-    Sets up the LangChain LLM (ChatOpenAI) with retries and timeout.
+# --- Utility Functions ---
 
-    Args:
-        lm_studio_url: The URL of the LM Studio instance.
-        llm_timeout: Timeout for LLM requests in seconds.
-        llm_max_tokens: Maximum number of tokens for the LLM response.
-        model: Model name to use.
+def print_grid(grid: List[List[str]], placed_words:List[Tuple[str, int, int, str]]=None, console:Optional[Console]=None) -> None:
+    """Prints a visual representation of the grid with optional highlighting of placed words."""
+    if console is None:
+        console = Console()
 
-    Returns:
-        A ChatOpenAI instance.
-    """
+    table = Table(show_header=False, show_edge=False, padding=0)
+
+    if placed_words is not None:
+         placed_coords = set()
+         for word, row, col, direction in placed_words:
+             for i in range(len(word)):
+                 if direction == "across":
+                     placed_coords.add((row, col + i))
+                 else:
+                     placed_coords.add((row + i, col))
+
+    for r_idx,row in enumerate(grid):
+        row_display = []
+        for c_idx,cell in enumerate(row):
+            if cell == "#":
+                row_display.append("[white on black]  [/]")
+            elif placed_words is not None and (r_idx,c_idx) in placed_coords:
+                row_display.append(f"[black on green]{cell.center(2)}[/]")  # Highlight placed letters
+            else:
+                row_display.append(f"[black on white]{cell.center(2)}[/]")
+
+        table.add_row(*row_display)
+
+    console.print(table)
+
+
+
+def calculate_word_frequency(word: str, word_frequencies: Dict[str, float]) -> float:
+    """Calculates a word's score based on its frequency (lower score is more common)."""
+    return word_frequencies.get(word.lower(), 1e-6)  # Default to a very low frequency if not found
+
+
+def load_words(filepath: str) -> Tuple[Dict[int, List[str]], Dict[str, float]]:
+    """Loads, preprocesses words, groups by length, and calculates frequencies."""
+    words_by_length: Dict[int, List[str]] = defaultdict(list)
+    word_counts: Dict[str, int] = defaultdict(int)
+    total_count = 0
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as file:
+            for line in file:
+                word = line.strip().upper()
+                word = WORD_CLEAN_RE.sub("", word)
+                if len(word) >= MIN_WORD_LENGTH:
+                    words_by_length[len(word)].append(word)
+                    word_counts[word.lower()] += 1
+                    total_count += 1
+
+        # Calculate frequencies
+        word_frequencies: Dict[str, float] = {
+            word: count / total_count for word, count in word_counts.items()
+        }
+        return words_by_length, word_frequencies
+
+    except FileNotFoundError:
+        logging.error(f"Word file not found at {filepath}")
+        sys.exit(1)
+    except Exception as e:
+        logging.error(f"Error loading or processing words: {e}")
+        sys.exit(1)
+
+
+# --- LangChain and LLM Setup ---
+
+def setup_langchain_llm(lm_studio_url: str, llm_timeout: int, llm_max_tokens: int, model: str) -> ChatOpenAI:
+    """Sets up the LangChain LLM with retries, timeout, and error handling."""
     try:
         llm = ChatOpenAI(
             base_url=lm_studio_url,
-            api_key="NA",  # API key is not needed for local models
+            api_key="NA",
             model=model,
             temperature=0.7,
             max_tokens=llm_max_tokens,
@@ -85,21 +160,20 @@ def setup_langchain_llm(
         logging.error(f"Failed to initialize ChatOpenAI: {e}")
         sys.exit(1)
 
-
-def generate_definition_langchain(
-    llm: ChatOpenAI, word: str, language: str, definition_cache: Dict[str, str]
-) -> str:
-    """Enhanced definition generation with better filtering."""
+@lru_cache(maxsize=512) #Memoize definition generation
+def generate_definition_langchain(llm: ChatOpenAI, word: str, language: str) -> str:
+    """Generates a crossword clue using LangChain, with retries and improved filtering."""
     if word in definition_cache:
         return definition_cache[word]
 
-    prompt_template = """Generate a short crossword clue for: {word}. Reply in {language}.
-    IMPORTANT RULES:
-    1. NEVER use the word itself or any part of it in the clue
-    2. Keep it under 10 words
-    3. No synonyms that are too obvious
-    4. No direct definitions
-    Format: Just the clue, nothing else."""
+    prompt_template = """Generate a short, concise crossword clue for: "{word}". Reply in {language}.
+    Strict Rules:
+    1. Absolutely NO part of the target word in the clue.
+    2. Clue must be 10 words or less.
+    3. Avoid obvious synonyms.
+    4. No direct definitions.
+    5. Focus on wordplay, double meanings, or indirect hints.
+    Output: Only the clue text, nothing else."""
 
     prompt = PromptTemplate.from_template(prompt_template)
     output_parser = StrOutputParser()
@@ -110,945 +184,766 @@ def generate_definition_langchain(
         | output_parser
     )
 
-    try:
-        definition = chain.invoke({"word": word, "language": language})
-        definition = definition.strip()
-        
-        # Enhanced cleaning
-        definition = re.sub(r'(?i)definizione[:\s]*', '', definition)
-        definition = re.sub(r'(?i)clue[:\s]*', '', definition)
-        definition = re.sub(r'^\d+[\.\)]\s*', '', definition)
-        definition = definition.strip()
+    for attempt in range(MAX_DEFINITION_ATTEMPTS):
+        try:
+            definition = chain.invoke({"word": word, "language": language})
+            definition = definition.strip()
 
-        # Check for word or parts in definition
-        word_lower = word.lower()
-        definition_lower = definition.lower()
-        
-        # Check various forbidden patterns
-        for pattern in FORBIDDEN_PATTERNS:
-            if re.search(pattern(word), definition, re.IGNORECASE):
-                return "Definizione alternativa richiesta"
+            # Enhanced cleaning and filtering
+            definition = re.sub(r'(?i)definizione[:\s]*', '', definition)
+            definition = re.sub(r'(?i)clue[:\s]*', '', definition)
+            definition = re.sub(r'^\d+[\.\)]\s*', '', definition).strip()
 
-        # Check for word parts (3+ letters)
-        for i in range(len(word) - 2):
-            for j in range(i + 3, len(word) + 1):
-                if word[i:j].lower() in definition_lower:
-                    return "Definizione alternativa richiesta"
+            for pattern in FORBIDDEN_PATTERNS:
+                if re.search(pattern(word), definition, re.IGNORECASE):
+                    raise ValueError("Forbidden word/pattern used in definition.")
 
-        definition_cache[word] = definition
-        return definition
+            # Check for word parts (3+ letters) - More efficient
+            word_lower = word.lower()
+            definition_lower = definition.lower()
+            if any(word_lower[i:j] in definition_lower for i in range(len(word) - 2) for j in range(i + 3, len(word) + 1)):
+                  raise ValueError("Part of the word used in the definition")
 
-    except Exception as e:
-        logging.error(f"Error generating definition for {word}: {e}")
-        return "Definizione non disponibile"
+            definition_cache[word] = definition
+            return definition
 
+        except Exception as e:
+            logging.warning(f"Attempt {attempt + 1} failed for word '{word}': {e}")
+            if attempt < MAX_DEFINITION_ATTEMPTS - 1:
+                time.sleep(DEFINITION_RETRY_DELAY)
 
-def _generate_definition(
-    llm: ChatOpenAI,
-    word: str,
-    row: int,
-    col: int,
-    direction: str,
-    cell_numbers: Dict[Tuple[int, int, str], int],
-    next_number_ref: List[int],
-    language: str,
-    definition_cache: Dict[str, str],
-) -> Tuple[str, int, str, str]:
-    """Helper to generate definitions (for threading)."""
-    if (row, col, direction) not in cell_numbers:
-        cell_numbers[(row, col, direction)] = next_number_ref[0]
-        next_number_ref[0] += 1
+    logging.error(f"Failed to generate definition for '{word}' after {MAX_DEFINITION_ATTEMPTS} attempts.")
+    return "Definizione non disponibile"  # Or a more specific fallback
 
-    definition = generate_definition_langchain(llm, word, language, definition_cache)
-    return direction, cell_numbers[(row, col, direction)], word, definition
-
-
-def order_cell_numbers(slots: List[Tuple[int, int, str, int]]) -> Dict[Tuple[int, int, str], int]:
-    """
-    Orders cell numbers according to standard crossword rules:
-    1. Top to bottom
-    2. Left to right
-    3. Number only cells that start a word
-    """
-    numbered_cells = set()
-    cell_numbers = {}
-    
-    # First, collect all starting positions
-    start_positions = []
-    for row, col, direction, length in slots:
-        if length >= MIN_WORD_LENGTH:  # Only consider valid word lengths
-            start_positions.append((row, col))
-            numbered_cells.add((row, col))
-    
-    # Sort positions top-to-bottom, left-to-right
-    start_positions.sort()
-    
-    # Assign numbers
-    current_number = 1
-    for row, col in start_positions:
-        # Find all slots starting at this position
-        for slot_row, slot_col, direction, length in slots:
-            if slot_row == row and slot_col == col and length >= MIN_WORD_LENGTH:
-                cell_numbers[(row, col, direction)] = current_number
-        current_number += 1
-
-    return cell_numbers
-
-
-def generate_definitions(
-    placed_words: List[Tuple[str, int, int, str]], llm: ChatOpenAI, language: str
-) -> Dict[str, Dict[int, str]]:
-    """Enhanced definition generation with proper numbering."""
-    definitions = {"across": {}, "down": {}}
-    definition_cache = {}
-    
-    # First, order all cell numbers
-    slots = [(word, row, col, direction) for word, row, col, direction in placed_words]
-    cell_numbers = order_cell_numbers(slots)
-    
-    with Progress() as progress:
-        task = progress.add_task("[blue]Generating Definitions...", total=len(placed_words))
-        with ThreadPoolExecutor() as executor:
-            futures = []
-            for word, row, col, direction in placed_words:
-                if len(word) >= MIN_WORD_LENGTH:  # Only process valid words
-                    futures.append(
-                        executor.submit(
-                            generate_definition_langchain,
-                            llm,
-                            word,
-                            language,
-                            definition_cache,
-                        )
-                    )
-
-            for future, (word, row, col, direction) in zip(as_completed(futures), placed_words):
-                try:
-                    definition = future.result()
-                    number = cell_numbers.get((row, col, direction))
-                    if number:  # Only add if we have a valid number
-                        definitions[direction][f"{number}. {word}"] = definition
-                except Exception as e:
-                    logging.error(f"Error retrieving definition: {e}")
-                progress.update(task, advance=1)
-    
-    return definitions
-
+# --- Grid Generation and Manipulation ---
 
 def generate_grid_from_string(grid_string: str) -> Optional[List[List[str]]]:
-    """Generates a grid from a string ('..#..\n.....')."""
+    """Generates grid from string, with validation."""
     lines = grid_string.strip().split("\n")
     grid: List[List[str]] = []
     for line in lines:
         row = [char for char in line.strip() if char in (".", "#")]
-        if len(row) != len(lines[0]): # Check consistent row length
-            logging.error("Invalid grid dimensions: inconsistent row length.")
+        if len(row) != len(lines[0]):
+            logging.error("Inconsistent row length in manual grid.")
             return None
         grid.append(row)
 
-    if not grid:
-        logging.error("Invalid grid: empty grid.")
+    if not grid or any(len(row) != len(grid[0]) for row in grid):  # Check for rectangular grid
+        logging.error("Invalid manual grid: empty or non-rectangular.")
+        return None
     return grid
 
 
 def generate_grid_from_file(filepath: str) -> Optional[List[List[str]]]:
-    """Loads grid from file. '#' = black, '.' = white."""
+    """Loads grid from file, with error handling."""
     try:
         with open(filepath, "r") as f:
-            grid_string = f.read()
-            return generate_grid_from_string(grid_string)
+            return generate_grid_from_string(f.read())
     except FileNotFoundError:
         logging.error(f"Grid file not found: {filepath}")
         return None
     except Exception as e:
-        logging.error(f"Error reading grid from file: {e}")
+        logging.error(f"Error reading grid file: {e}")
         return None
 
+def is_valid_grid(grid: List[List[str]]) -> bool:
+    """Checks if the grid is valid (rectangular, contains only '.' and '#')."""
+    if not grid:
+        return False
+    width = len(grid[0])
+    return all(len(row) == width and all(c in ('.', '#') for c in row) for row in grid)
 
-def generate_grid_random(
-    width: int, height: int, black_square_ratio: float
-) -> List[List[str]]:
-    """Generates a random crossword grid with improved patterns."""
+def generate_grid_random(width: int, height: int, black_square_ratio: float) -> List[List[str]]:
+    """Generates a random, symmetrical crossword grid with improved black square placement."""
     grid = [["." for _ in range(width)] for _ in range(height)]
     num_black_squares = int(width * height * black_square_ratio)
-    
-    # Ensure symmetrical pattern
-    def add_symmetric_squares(row: int, col: int):
+
+    # Helper function for symmetrical placement
+    def place_symmetrically(row: int, col: int):
         grid[row][col] = "#"
-        # Add symmetrical square
         grid[height - 1 - row][width - 1 - col] = "#"
-        
-    with Progress() as progress:
-        task1 = progress.add_task("[red]Generating Grid...", total=num_black_squares//2)
-        placed = 0
-        max_attempts = 1000
-        attempts = 0
-        
-        while placed < num_black_squares//2 and attempts < max_attempts:
-            row = random.randint(0, height - 1)
-            col = random.randint(0, width - 1)
-            
-            # Check if placement creates valid patterns
-            if grid[row][col] == "." and grid[height-1-row][width-1-col] == ".":
-                # Check surrounding cells
-                valid = True
-                for dr, dc in [(0,1), (0,-1), (1,0), (-1,0)]:
-                    new_row, new_col = row + dr, col + dc
-                    if 0 <= new_row < height and 0 <= new_col < width:
-                        if grid[new_row][new_col] == "#":
-                            # Don't create 2x2 black square blocks
-                            valid = False
-                            break
-                
-                if valid:
-                    add_symmetric_squares(row, col)
-                    placed += 1
-                    progress.update(task1, advance=1)
-            
-            attempts += 1
-            
-        # If we couldn't place enough black squares, try again
-        if placed < num_black_squares//2:
-            return generate_grid_random(width, height, black_square_ratio)
-            
+
+    # 1. Central square (for odd dimensions)
+    if width % 2 == 1 and height % 2 == 1:
+        place_symmetrically(height // 2, width // 2)
+        num_black_squares -= 1  # Adjust count if central square is placed
+
+    placed_count = 0
+    attempts = 0
+    max_attempts = width * height * 5  # Increased attempts, but still limited
+
+    while placed_count < num_black_squares and attempts < max_attempts:
+        attempts += 1
+        row, col = random.randint(0, height - 1), random.randint(0, width - 1)
+
+        if grid[row][col] == ".":  # Only try to place on empty squares
+            # Check for 2x2 blocks *before* placement (more efficient)
+            if (row > 0 and col > 0 and grid[row-1][col] == "#" and grid[row][col-1] == "#" and grid[row-1][col-1] == "#") or \
+               (row > 0 and col < width - 1 and grid[row-1][col] == "#" and grid[row][col+1] == "#" and grid[row-1][col+1] == "#") or \
+               (row < height - 1 and col > 0 and grid[row+1][col] == "#" and grid[row][col-1] == "#" and grid[row+1][col-1] == "#") or \
+               (row < height - 1 and col < width - 1 and grid[row+1][col] == "#" and grid[row][col+1] == "#" and grid[row+1][col+1] == "#"):
+                continue  # Skip this placement to avoid 2x2 block
+
+            place_symmetrically(row, col)
+            placed_count += 2 if (row,col) != (height-1-row,width-1-col) else 1
+
+    # If not enough squares placed, don't infinitely recurse; log and return the best attempt.
+    if placed_count < num_black_squares:
+        logging.warning(f"Could only place {placed_count} of {num_black_squares} black squares.")
     return grid
 
 
-def generate_grid(
-    width: int,
-    height: int,
-    black_square_ratio: float,
-    manual_grid: Optional[str] = None,
-    grid_file: Optional[str] = None,
-) -> List[List[str]]:
-    """Generates crossword grid (various methods)."""
-
+def generate_grid(width: int, height: int, black_square_ratio: float, manual_grid: Optional[str] = None, grid_file: Optional[str] = None) -> List[List[str]]:
+    """Generates grid using specified method, with fallback to random generation."""
     if manual_grid:
         grid = generate_grid_from_string(manual_grid)
         if grid:
             return grid
-        logging.warning("Invalid manual grid. Generating random grid instead.")
+        logging.warning("Invalid manual grid. Generating random grid.")
 
     if grid_file:
         grid = generate_grid_from_file(grid_file)
         if grid:
             return grid
-        logging.warning("Invalid grid file. Generating random grid instead.")
+        logging.warning("Invalid grid file. Generating random grid.")
 
     return generate_grid_random(width, height, black_square_ratio)
 
 
 def find_slots(grid: List[List[str]]) -> List[Tuple[int, int, str, int]]:
-    """Finds word slots (across and down)."""
-    height = len(grid)
-    width = len(grid[0])
-    slots: List[Tuple[int, int, str, int]] = []
-    with Progress() as progress:
-        task = progress.add_task("[cyan]Finding Slots...", total=height + width)
+    """Identifies word slots (across and down) in the grid."""
+    height, width = len(grid), len(grid[0])
+    slots = []
 
-        for row_index in range(height):
-            start = -1
-            for col_index in range(width):
-                if grid[row_index][col_index] == ".":
-                    if start == -1:
-                        start = col_index
-                elif start != -1:
-                    length = col_index - start
-                    if length > 1:
-                        slots.append((row_index, start, "across", length))
-                    start = -1
-            if start != -1:
-                length = width - start
-                if length > 1:
-                    slots.append((row_index, start, "across", length))
-            progress.update(task, advance=1)
+    # Across slots
+    for r in range(height):
+        start = -1
+        for c in range(width):
+            if grid[r][c] == ".":
+                if start == -1:
+                    start = c
+            elif start != -1:
+                length = c - start
+                if length >= MIN_WORD_LENGTH:
+                    slots.append((r, start, "across", length))
+                start = -1
+        if start != -1 and width - start >= MIN_WORD_LENGTH:
+            slots.append((r, start, "across", width - start))
 
-        for col_index in range(width):
-            start = -1
-            for row_index in range(height):
-                if grid[row_index][col_index] == ".":
-                    if start == -1:
-                        start = row_index
-                elif start != -1:
-                    length = row_index - start
-                    if length > 1:
-                        slots.append((start, col_index, "down", length))
-                    start = -1
-            if start != -1:
-                length = height - start
-                if length > 1:
-                    slots.append((start, col_index, "down", length))
-            progress.update(task, advance=1)
+    # Down slots
+    for c in range(width):
+        start = -1
+        for r in range(height):
+            if grid[r][c] == ".":
+                if start == -1:
+                    start = r
+            elif start != -1:
+                length = r - start
+                if length >= MIN_WORD_LENGTH:
+                    slots.append((start, c, "down", length))
+                start = -1
+        if start != -1 and height - start >= MIN_WORD_LENGTH:
+            slots.append((start, c, "down", height - start))
     return slots
 
-
-def load_words(filepath: str) -> Dict[int, List[str]]:
-    """Loads and preprocesses words, groups by length."""
-    words_by_length: Dict[int, List[str]] = {}
-    try:
-        with open(filepath, "r", encoding="utf-8") as file:
-            with Progress() as progress:
-                file.seek(0, 2)  # Move to the end
-                file_size = file.tell()  # Get file size
-                file.seek(0)  # Back to beginning
-                task = progress.add_task(
-                    "[green]Loading and Preprocessing Words...", total=file_size
-                )
-                for line in file:
-                    word = line.strip().upper()
-                    word = WORD_CLEAN_RE.sub("", word)
-
-                    if not word:
-                        continue
-
-                    length = len(word)
-                    if length > 1:
-                        if length not in words_by_length:
-                            words_by_length[length] = []
-                        words_by_length[length].append(word)
-                    progress.update(task, advance=len(line.encode("utf-8")))
-
-    except FileNotFoundError:
-        logging.error(f"Word file not found at {filepath}")
-        sys.exit(1)
-    except Exception as e:
-        logging.error(f"Error loading words: {e}")
-        sys.exit(1)
-
-    return words_by_length
-
-
-def is_valid_placement(
-    grid: List[List[str]], word: str, row: int, col: int, direction: str
-) -> bool:
-    """Less restrictive placement validation."""
-    if len(word) < MIN_WORD_LENGTH:
-        return False
-        
+def is_valid_placement(grid: List[List[str]], word: str, row: int, col: int, direction: str) -> bool:
+    """Checks if word can be placed at given location and direction."""
     length = len(word)
-    height = len(grid)
-    width = len(grid[0])
-    
-    # Check boundaries
     if direction == "across":
-        if col + length > width:
+        if col + length > len(grid[0]):
             return False
-    else:
-        if row + length > height:
+        for i in range(length):
+            if grid[row][col + i] != "." and grid[row][col + i] != word[i]:
+                return False
+    else:  # down
+        if row + length > len(grid):
             return False
-            
-    # Check for valid intersections only
-    if direction == "across":
         for i in range(length):
-            current = grid[row][col + i]
-            if current != "." and current != word[i]:
+            if grid[row + i][col] != "." and grid[row + i][col] != word[i]:
                 return False
-    else:
-        for i in range(length):
-            current = grid[row + i][col]
-            if current != "." and current != word[i]:
-                return False
-                    
     return True
 
+def _is_valid_cached(grid: List[List[str]], word: str, row: int, col: int, direction: str) -> bool:
+    """Cached version of is_valid_placement."""
+    key = f"{word}:{row}:{col}:{direction}"
+    with cache_lock:
+        if key not in placement_cache:
+            placement_cache[key] = is_valid_placement(grid, word, row, col, direction)
+        return placement_cache[key]
 
-def place_word(
-    grid: List[List[str]], word: str, row: int, col: int, direction: str
-) -> List[List[str]]:
-    """Places a word in the grid (creates a copy)."""
-    new_grid = grid.copy()  # Create a shallow copy of the outer list
-    for i in range(len(new_grid)):
-        new_grid[i] = new_grid[i].copy() # Deep copy
-    length = len(word)
-    if direction == "across":
-        for i in range(length):
-            new_grid[row][col + i] = word[i]
-    else:
-        for i in range(length):
-            new_grid[row + i][col] = word[i]
+
+def place_word(grid: List[List[str]], word: str, row: int, col: int, direction: str) -> List[List[str]]:
+    """Places a word onto a *copy* of the grid."""
+    new_grid = [row[:] for row in grid]  # Deep copy for safety
+    for i, letter in enumerate(word):
+        if direction == "across":
+            new_grid[row][col + i] = letter
+        else:
+            new_grid[row + i][col] = letter
+    return new_grid
+
+def remove_word(grid: List[List[str]], word: str, row: int, col: int, direction: str) -> List[List[str]]:
+    """Removes a word from a *copy* of the grid."""
+    new_grid = [row[:] for row in grid]  # Deep copy for safety
+    for i in range(len(word)):
+        if direction == "across":
+            if new_grid[row][col+i] == word[i]: #Only remove if it is the placed word
+                new_grid[row][col + i] = "."
+        else:
+            if new_grid[row+i][col] == word[i]:
+                new_grid[row + i][col] = "."
+
     return new_grid
 
 
-def check_all_letters_connected(
-    grid: List[List[str]], placed_words: List[Tuple[str, int, int, str]]
-) -> bool:
-    """Ensures all placed letters are part of across and down words."""
-    height = len(grid)
-    width = len(grid[0])
-    letter_grid = [["" for _ in range(width)] for _ in range(height)]
-    placed_coords = set()
 
+def check_all_letters_connected(grid: List[List[str]], placed_words: List[Tuple[str, int, int, str]]) -> bool:
+    """Checks if all placed letters are part of both across and down words."""
+    if not placed_words:
+        return True
+
+    letter_positions = set()
     for word, row, col, direction in placed_words:
-        for i, letter in enumerate(word):
+        for i in range(len(word)):
             if direction == "across":
-                letter_grid[row][col + i] = letter
-                placed_coords.add((row, col + i))
+                letter_positions.add((row, col + i))
             else:
-                letter_grid[row + i][col] = letter
-                placed_coords.add((row + i, col))
+                letter_positions.add((row + i, col))
 
-    for row, col in placed_coords:
-        in_across = False
-        in_down = False
-        for word, word_row, word_col, word_dir in placed_words:
-            if (
-                word_dir == "across"
-                and word_row == row
-                and word_col <= col < word_col + len(word)
-            ):
-                in_across = True
-            elif (
-                word_dir == "down"
-                and word_col == col
-                and word_row <= row < word_row + len(word)
-            ):
-                in_down = True
+    for row, col in letter_positions:
+        in_across = any(
+            row == r and col >= c and col < c + len(w)
+            for w, r, c, d in placed_words if d == "across"
+        )
+        in_down = any(
+            col == c and row >= r and row < r + len(w)
+            for w, r, c, d in placed_words if d == "down"
+        )
         if not (in_across and in_down):
-            return False  # Letter not in both
+            return False  # Letter not part of both across and down words
 
     return True  # All letters connected
 
+def _validate_remaining_slots(grid: List[List[str]], slots: List[Tuple[int, int, str, int]], words_by_length: Dict[int, List[str]]) -> bool:
+    """Checks if, for all remaining slots, at least one valid word exists (forward checking)."""
+    for row, col, direction, length in slots:
+        if not any(_is_valid_cached(grid, word, row, col, direction) for word in words_by_length.get(length, [])):
+            return False  # No valid words for this slot
+    return True
 
-def slots_intersect(
-    slot1: Tuple[int, int, str, int], slot2: Tuple[int, int, str, int]
-) -> bool:
-    """Checks if two slots intersect."""
-    row1, col1, dir1, len1 = slot1
-    row2, col2, dir2, len2 = slot2
+def calculate_intersection_score(grid:List[List[str]], word:str, row:int, col:int, direction:str, placed_words: List[Tuple[str, int, int, str]]) -> float:
+    """Calculates an intersection score, rewarding more intersections and rarer letters."""
 
-    if dir1 == dir2:
-        return False  # Parallel
-
-    if dir1 == "across":
-        if col1 <= col2 < col1 + len1 and row2 <= row1 < row2 + len2:
-            return True
-    else:  # dir1 == "down"
-        if row1 <= row2 < row1 + len1 and col2 <= col1 < col2 + len2:
-            return True
-
-    return False
-
-
-def calculate_intersections(
-    slots: List[Tuple[int, int, str, int]]
-) -> Dict[int, List[int]]:
-    """Calculates which slots intersect."""
-    intersections: Dict[int, List[int]] = {i: [] for i in range(len(slots))}
-    for i in range(len(slots)):
-        for j in range(i + 1, len(slots)):
-            if slots_intersect(slots[i], slots[j]):
-                intersections[i].append(j)
-                intersections[j].append(i)
-    return intersections
-
-
-def calculate_word_score(word: str) -> float:
-    """Calculate word score based on letter frequencies and uniqueness."""
-    # Common letters get lower scores to encourage more intersections
-    common_letters = 'EARIOTNSLC'
-    uncommon_letters = 'JQXZWYVKBP'
-    
-    score = 0.0
-    for letter in word:
-        if letter in common_letters:
-            score += 0.5
-        elif letter in uncommon_letters:
-            score += 2.0
-        else:
-            score += 1.0
-            
-    # Bonus for words with diverse letters
-    unique_letters = len(set(word))
-    score += unique_letters * 0.5
-    
-    return score
-
-def get_intersection_quality(
-    word: str,
-    row: int,
-    col: int,
-    direction: str,
-    placed_words: List[Tuple[str, int, int, str]]
-) -> float:
-    """Calculate how well a word intersects with existing words."""
+    intersections = 0
     score = 0.0
     length = len(word)
-    
+
     for placed_word, p_row, p_col, p_dir in placed_words:
         if direction == "across" and p_dir == "down":
-            if p_col >= col and p_col < col + length:
+            if p_col >= col and p_col < col + length:  # Potential intersection
                 if row >= p_row and row < p_row + len(placed_word):
-                    # Reward intersections that use less common letters
-                    intersection_letter = word[p_col - col]
-                    if intersection_letter in 'JQXZW':
-                        score += 3.0
-                    elif intersection_letter in 'YVKBP':
-                        score += 2.0
-                    else:
-                        score += 1.0
+                    intersections +=1
+                    score += 1
         elif direction == "down" and p_dir == "across":
-            if p_row >= row and p_row < row + length:
+            if p_row >= row and p_row < row+length:
                 if col >= p_col and col < p_col + len(placed_word):
-                    intersection_letter = word[p_row - row]
-                    if intersection_letter in 'JQXZW':
-                        score += 3.0
-                    elif intersection_letter in 'YVKBP':
-                        score += 2.0
-                    else:
-                        score += 1.0
-    
-    return score
+                    intersections += 1
+                    score +=1
+
+    return score + intersections * 0.5 # intersections have additional score
+
+
+
+def get_slot_score(
+    grid: List[List[str]],
+    slot: Tuple[int, int, str, int],
+    words_by_length: Dict[int, List[str]],
+    placed_words: List[Tuple[str,int,int,str]]
+) -> float:
+    """Scores a slot based on constrainedness and potential for good intersections."""
+    row, col, direction, length = slot
+    possible_words = sum(1 for w in words_by_length.get(length, []) if _is_valid_cached(grid, w, row, col, direction))
+    if possible_words == 0:
+        return -1.0  # No valid words, very bad slot
+
+    # Calculate a constrainedness score (fewer options = higher priority)
+    constrainedness_score = 1.0 / possible_words
+
+    # Calculate intersection score by simulating placements
+    intersection_potential = 0.0
+    for word in words_by_length.get(length, []):
+        if _is_valid_cached(grid,word,row,col,direction):
+            intersection_potential += calculate_intersection_score(grid, word, row, col, direction, placed_words)
+
+    return constrainedness_score + intersection_potential * 0.1 # intersection potential is less important.
+
+
+# --- Word Selection (Recursive, with Backtracking and Parallelism) ---
 
 class CrosswordStats:
+    """Tracks statistics about the crossword generation process."""
     def __init__(self):
         self.attempts = 0
         self.backtracks = 0
         self.words_tried = 0
         self.successful_placements = 0
         self.failed_placements = 0
-        self.time_spent = 0
-        self.slot_fill_order = []
-        
-    def get_summary(self) -> str:
-        return f"""
-📊 Crossword Generation Stats:
-├─ Total Attempts: {self.attempts}
-├─ Backtracking Events: {self.backtracks}
-├─ Words Evaluated: {self.words_tried}
-├─ Successful Placements: {self.successful_placements}
-├─ Failed Placements: {self.failed_placements}
-├─ Success Rate: {(self.successful_placements/max(1,self.words_tried))*100:.1f}%
-└─ Time Spent: {self.time_spent:.2f}s
-"""
+        self.time_spent = 0.0
+        self.start_time = time.time()
+        self.slot_fill_order: List[Tuple[int, int, str]] = [] # Log the order
+        self.definition_failures = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
 
-def try_slot_parallel(
+    def update_time(self):
+        self.time_spent = time.time() - self.start_time
+
+    def get_summary(self) -> str:
+        """Returns a formatted summary of the statistics."""
+        self.update_time()
+        summary = (
+            "📊 Crossword Generation Stats:\n"
+            f"├── Attempts: {self.attempts}\n"
+            f"├── Backtracks: {self.backtracks}\n"
+            f"├── Words Tried: {self.words_tried}\n"
+            f"├── Successful Placements: {self.successful_placements}\n"
+            f"├── Failed Placements: {self.failed_placements}\n"
+            f"├── Definition Failures: {self.definition_failures}\n"
+            f"├── Placement Cache Hits: {self.cache_hits}\n"
+            f"├── Placement Cache Misses: {self.cache_misses}\n"
+            f"├── Success Rate: {self.successful_placements / max(1, self.words_tried) * 100:.2f}%\n"
+            f"└── Time Spent: {self.time_spent:.2f}s\n"
+            f"└── Slots Filled Order: {self.slot_fill_order}"
+        )
+        return summary
+
+stats = CrosswordStats() # Global stats object
+
+def validate_placement(grid: List[List[str]], slot: Tuple[int, int, str, int], 
+                      word: str, remaining_slots: List[Tuple[int, int, str, int]], 
+                      words_by_length: Dict[int, List[str]]) -> bool:
+    """Validates if a word placement is valid and doesn't create impossible situations."""
+    row, col, direction, _ = slot
+    
+    # Check basic placement validity
+    if not _is_valid_cached(grid, word, row, col, direction):
+        return False
+        
+    # Check if remaining slots are still fillable (forward checking)
+    temp_grid = place_word(grid, word, row, col, direction)
+    return _validate_remaining_slots(temp_grid, remaining_slots, words_by_length)
+
+def make_placement(grid: List[List[str]], slot: Tuple[int, int, str, int], 
+                  word: str, placed_words: List[Tuple[str, int, int, str]]) -> Tuple[List[List[str]], List[Tuple[str, int, int, str]]]:
+    """Places a word and updates the placed_words list."""
+    row, col, direction, _ = slot
+    new_grid = place_word(grid, word, row, col, direction)
+    new_placed_words = placed_words + [(word, row, col, direction)]
+    
+    stats.successful_placements += 1
+    stats.words_tried += 1
+    stats.slot_fill_order.append((row, col, direction))
+    
+    return new_grid, new_placed_words
+
+def handle_backtrack(slot: Tuple[int, int, str, int]) -> None:
+    """Handles statistics and cleanup during backtracking."""
+    row, col, direction = slot[0], slot[1], slot[2]
+    stats.backtracks += 1
+    stats.failed_placements += 1
+    if stats.slot_fill_order:  # Check if there's anything to pop
+        stats.slot_fill_order.pop()
+
+def try_slot(
     grid: List[List[str]],
     slot: Tuple[int, int, str, int],
     word: str,
     remaining_slots: List[Tuple[int, int, str, int]],
     words_by_length: Dict[int, List[str]],
+    word_frequencies: Dict[str, float],
     placed_words: List[Tuple[str, int, int, str]],
-    max_attempts: int,
-    start_time: float,
-    timeout: int,
     progress: Progress,
     task: TaskID,
-    stats: CrosswordStats,
-    recursion_depth: int,
-    cache: Dict[str, bool],
-    beam_width: int
+    difficulty: str = DEFAULT_DIFFICULTY
 ) -> Tuple[Optional[List[List[str]]], Optional[List[Tuple[str, int, int, str]]]]:
-    """Helper function for parallel word placement attempts"""
-    row, col, direction, _ = slot
-    progress.update(task, advance=1)
-    new_grid = place_word(grid, word, row, col, direction)
-    new_placed_words = placed_words + [(word, row, col, direction)]
-    stats.successful_placements += 1
-
+    """Attempts to place a word in a slot and continues recursively (without threading)."""
+    
+    # Validate placement
+    if not validate_placement(grid, slot, word, remaining_slots, words_by_length):
+        return None, None
+        
+    # Make placement
+    new_grid, new_placed_words = make_placement(grid, slot, word, placed_words)
+    
+    # Call select_words_recursive directly (no threading)
     result = select_words_recursive(
         new_grid,
         remaining_slots,
         words_by_length,
+        word_frequencies,
         new_placed_words,
-        max_attempts,
-        start_time,
-        timeout,
         progress,
         task,
-        stats,
-        recursion_depth + 1,
-        cache,
-        beam_width
+        difficulty,
+        None  # Pass None for executor to indicate no threading
     )
     
-    return result
+    if result[0] is not None:
+        return result
+        
+    # Handle backtracking
+    handle_backtrack(slot)
+    return None, None
+
+def adjust_black_squares_ratio(grid: List[List[str]], target_word_count: int, 
+                             current_ratio: float) -> float:
+    """Dynamically adjusts black square ratio based on word count."""
+    slots = find_slots(grid)
+    current_word_count = len(slots)
+    
+    if current_word_count < target_word_count:
+        return max(0.05, current_ratio - 0.02)  # Decrease black squares
+    elif current_word_count > target_word_count * 1.2:  # 20% tolerance
+        return min(0.30, current_ratio + 0.02)  # Increase black squares
+    return current_ratio
 
 def select_words_recursive(
     grid: List[List[str]],
     slots: List[Tuple[int, int, str, int]],
-    words_by_length: Dict[int, List[str]], 
+    words_by_length: Dict[int, List[str]],
+    word_frequencies: Dict[str, float],
     placed_words: List[Tuple[str, int, int, str]],
-    max_attempts: int,
-    start_time: float,
-    timeout: int,
     progress: Progress,
     task: TaskID,
-    stats: CrosswordStats,
-    recursion_depth: int = 0,
-    cache: Dict[str, bool] = None,
-    beam_width: int = DEFAULT_BEAM_WIDTH,
+    difficulty: str = DEFAULT_DIFFICULTY,
+    executor: Optional[ThreadPoolExecutor] = None
 ) -> Tuple[Optional[List[List[str]]], Optional[List[Tuple[str, int, int, str]]]]:
-    """Enhanced recursive word selection with parallel processing."""
-    cache = cache or {}
-    
+    """Recursively selects and places words, with controlled threading."""
     stats.attempts += 1
-    current_time = time.time()
-    stats.time_spent = current_time - start_time
-
-    # Early termination checks
-    if current_time - start_time > timeout or recursion_depth > MAX_RECURSION_DEPTH:
-        stats.backtracks += 1
+    stats.update_time()
+    
+    if stats.time_spent > DEFAULT_TIMEOUT:
         return None, None
-
+        
     if not slots:
         if check_all_letters_connected(grid, placed_words):
-            print("\nSuccessful grid configuration:")
-            print_grid(grid)
             return grid, placed_words
         return None, None
-
-    # Enhanced slot selection with scoring
-    slot_scores = []
+    
+    # Score and sort slots
+    scored_slots = []
     for slot in slots:
-        row, col, direction, length = slot
-        
-        # Calculate constrainedness score
-        constraints = 0
-        possible_words = 0
-        for word in words_by_length.get(length, []):
-            if _is_valid_cached(grid, word, row, col, direction, cache):
-                possible_words += 1
-                constraints += sum(1 for c in word if c in "JQXZW")
-        
-        if possible_words == 0:
-            stats.failed_placements += 1
-            return None, None
-            
-        score = (1.0/possible_words) * (constraints + 1)
-        slot_scores.append((score, slot))
+        base_score = get_slot_score(grid, slot, words_by_length, placed_words)
+        location_bonus = get_location_score(grid, slot)
+        total_score = base_score + location_bonus
+        scored_slots.append((total_score, slot))
     
-    slot_scores.sort(reverse=True)
+    scored_slots.sort(key=lambda x: x[0], reverse=True)
     
-    # Process most constrained slots first
-    for _, slot in slot_scores[:beam_width]:
+    # Process top slots
+    for score, slot in scored_slots[:DEFAULT_BEAM_WIDTH]:
         row, col, direction, length = slot
         remaining_slots = [s for s in slots if s != slot]
-
-        # Score candidate words
+        
+        # Score words considering difficulty
         word_scores = []
+        freq_weight = WORD_FREQUENCY_WEIGHTS[difficulty]
+        
         for word in words_by_length.get(length, []):
-            if _is_valid_cached(grid, word, row, col, direction, cache):
-                score = calculate_word_score(word) + get_intersection_quality(
-                    word, row, col, direction, placed_words
-                )
-                word_scores.append((score, word))
+            if _is_valid_cached(grid, word, row, col, direction):
+                intersection_score = calculate_intersection_score(grid, word, row, col, direction, placed_words)
+                frequency_score = calculate_word_frequency(word, word_frequencies)
+                word_score = (intersection_score * (1 - freq_weight) + 
+                            (1 - frequency_score) * freq_weight)
+                word_scores.append((word_score, word))
         
-        word_scores.sort(reverse=True)
+        word_scores.sort(key=lambda x: x[0], reverse=True)
         
-        # Try best words in parallel
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        # Use threading only at the top level
+        if executor is not None:
             futures = []
             for _, word in word_scores[:DEFAULT_MAX_BACKTRACK]:
-                futures.append(
-                    executor.submit(
-                        try_slot_parallel,
-                        grid,
-                        slot,
-                        word,
-                        remaining_slots,
-                        words_by_length,
-                        placed_words,
-                        max_attempts,
-                        start_time,
-                        timeout,
-                        progress,
-                        task,
-                        stats,
-                        recursion_depth,
-                        cache,
-                        beam_width
-                    )
+                future = executor.submit(
+                    try_slot, grid, slot, word, remaining_slots,
+                    words_by_length, word_frequencies, placed_words,
+                    progress, task, difficulty
                 )
+                futures.append(future)
             
-            # Process results as they complete
             for future in as_completed(futures):
-                result = future.result()
+                try:
+                    result = future.result()
+                    if result[0] is not None:
+                        return result
+                except Exception as e:
+                    logging.warning(f"Error in word placement thread: {e}")
+                    continue
+        else:
+            # Sequential processing for recursive calls
+            for _, word in word_scores[:DEFAULT_MAX_BACKTRACK]:
+                result = try_slot(
+                    grid, slot, word, remaining_slots,
+                    words_by_length, word_frequencies, placed_words,
+                    progress, task, difficulty
+                )
                 if result[0] is not None:
                     return result
-
-    stats.backtracks += 1
+    
     return None, None
 
-def _is_valid_cached(
-    grid: List[List[str]], 
-    word: str,
-    row: int,
-    col: int,
-    direction: str,
-    cache: Dict[str, bool]
-) -> bool:
-    """Cached version of is_valid_placement."""
-    key = f"{word}:{row}:{col}:{direction}"
-    if key not in cache:
-        cache[key] = is_valid_placement(grid, word, row, col, direction)
-    return cache[key]
-
-def _validate_remaining_slots(
-    grid: List[List[str]],
-    slots: List[Tuple[int, int, str, int]],
-    words_by_length: Dict[int, List[str]],
-    cache: Dict[str, bool]
-) -> bool:
-    """Forward checking - ensure all slots have at least one valid word."""
-    for row, col, direction, length in slots:
-        if not any(_is_valid_cached(grid, word, row, col, direction, cache)
-                  for word in words_by_length.get(length, [])):
-            return False
-    return True
-
-def _words_intersect(
-    word1: Tuple[str, int, int, str],
-    word2: Tuple[str, int, int, str]
-) -> bool:
-    """Check if two word placements intersect."""
-    _, row1, col1, dir1 = word1
-    _, row2, col2, dir2 = word2
+def get_location_score(grid: List[List[str]], slot: Tuple[int, int, str, int]) -> float:
+    """Calculates a score based on slot location and shape."""
+    row, col, direction, length = slot
+    height, width = len(grid), len(grid[0])
     
-    if dir1 == dir2:
-        return False
-        
-    if dir1 == "across":
-        return (col2 >= col1 and col2 < col1 + len(word1[0]) and
-                row1 >= row2 and row1 < row2 + len(word2[0]))
+    # Center bonus (slots closer to center get higher scores)
+    center_row, center_col = height // 2, width // 2
+    distance_to_center = abs(row - center_row) + abs(col - center_col)
+    center_bonus = 1.0 - (distance_to_center / (height + width))
+    
+    # Length bonus (longer words get slightly higher priority)
+    length_bonus = length / max(height, width)
+    
+    # Intersection potential (slots that cross more other slots get higher scores)
+    crossing_slots = 0
+    if direction == "across":
+        for i in range(length):
+            if any(grid[r][col + i] == "." for r in range(height)):
+                crossing_slots += 1
     else:
-        return (row2 >= row1 and row2 < row1 + len(word1[0]) and
-                col1 >= col2 and col1 < col2 + len(word2[0]))
-
+        for i in range(length):
+            if any(grid[row + i][c] == "." for c in range(width)):
+                crossing_slots += 1
+                
+    intersection_bonus = crossing_slots / length
+    
+    return (center_bonus * 0.4 + length_bonus * 0.3 + intersection_bonus * 0.3)
 
 def select_words(
-    grid: List[List[str]],
-    slots: List[Tuple[int, int, str, int]],
-    words_by_length: Dict[int, List[str]],
-    progress: Progress,
-    task: TaskID,
-    timeout: int = DEFAULT_TIMEOUT,
+        grid: List[List[str]],
+        slots: List[Tuple[int, int, str, int]],
+        words_by_length: Dict[int, List[str]],
+        word_frequencies: Dict[str, float],  # Pass word frequencies
+        progress: Progress,
+        task: TaskID
 ) -> Tuple[Optional[List[List[str]]], Optional[List[Tuple[str, int, int, str]]]]:
-    """Enhanced word selection with statistics tracking."""
-    
+    """Initializes word selection with a single thread pool."""
+    global stats
     stats = CrosswordStats()
-    start_time = time.time()
+    stats.start_time = time.time()
     
-    intersections = calculate_intersections(slots)
-    sorted_slots = sorted(
-        slots,
-        key=lambda x: (len(intersections.get(slots.index(x), [])), x[3]),
-        reverse=True,
-    )
+    initial_placed_words: List[Tuple[str, int, int, str]] = []
+    
+    # Create a single thread pool for top-level parallelization
+    with ThreadPoolExecutor(max_workers=MAX_THREAD_POOL_SIZE) as executor:
+        return select_words_recursive(
+            grid, slots, words_by_length, word_frequencies,
+            initial_placed_words, progress, task,
+            DEFAULT_DIFFICULTY, executor
+        )
 
-    total_estimated_attempts = sum(
-        sum(1 for word in words_by_length.get(slot[3], [])
-            if is_valid_placement(grid, word, slot[0], slot[1], slot[2]))
-        for slot in sorted_slots
-    )
-    progress.update(task, total=total_estimated_attempts)
-    
-    filled_grid, placed_words = select_words_recursive(
-        grid,
-        sorted_slots,
-        words_by_length,
-        [],
-        DEFAULT_MAX_ATTEMPTS,
-        start_time,
-        timeout,
-        progress,
-        task,
-        stats
-    )
+# --- Definition and Crossword Generation ---
+def order_cell_numbers(slots: List[Tuple[int, int, str, int]]) -> Dict[Tuple[int, int, str], int]:
+    """Orders cell numbers for crossword clues (top-to-bottom, left-to-right)."""
+    numbered_cells = set()  # Track cells that have been numbered
+    cell_numbers: Dict[Tuple[int, int, str], int] = {}
+    next_number = 1
 
-    # Print statistics
-    logging.info(stats.get_summary())
-    
-    return filled_grid, placed_words
+    # Sort slots: first by row, then by column, then by direction (across before down)
+    sorted_slots = sorted(slots, key=lambda x: (x[0], x[1], 0 if x[2] == "across" else 1))
 
+    for row, col, direction, length in sorted_slots:
+        if (row, col) not in numbered_cells:  # Only number if this cell starts a word
+            cell_numbers[(row, col, direction)] = next_number
+            numbered_cells.add((row, col))
+            next_number += 1
 
-def print_grid(grid: List[List[str]]) -> None:
-    """Prints a visual representation of the grid."""
-    from rich.console import Console
-    from rich.table import Table
-    
-    console = Console()
-    table = Table(show_header=False, show_edge=False, padding=0)
-    
-    for row in grid:
-        table.add_row(*[
-            "[white on black]  [/]" if cell == "#" else "[black on white]  [/]" 
-            for cell in row
-        ])
-    
-    console.print(table)
+    return cell_numbers
+
+def generate_definitions(placed_words: List[Tuple[str, int, int, str]], llm: ChatOpenAI, language: str) -> Dict[str, Dict[int, str]]:
+    """Generates definitions for placed words, with proper numbering."""
+    definitions = {"across": {}, "down": {}}
+
+    # First, order all cell numbers
+    slots = [(row, col, direction, len(word)) for word, row, col, direction in placed_words]
+    cell_numbers = order_cell_numbers(slots)
+
+    with Progress() as progress:
+        task = progress.add_task("[blue]Generating Definitions...", total=len(placed_words))
+        with ThreadPoolExecutor() as executor:
+            futures = []
+            for word, row, col, direction in placed_words:
+                future = executor.submit(generate_definition_langchain, llm, word, language)
+                futures.append((future, word, row, col, direction)) #Store all data for easier processing
+
+            for future, word, row, col, direction in futures:
+                try:
+                    definition = future.result()
+                    number = cell_numbers.get((row, col, direction))
+                    if number:
+                        definitions[direction][f"{number}. {word}"] = definition
+                except Exception as e:
+                    stats.definition_failures += 1 #Increment failures
+                    logging.error(f"Error retrieving definition for {word}: {e}")
+                progress.update(task, advance=1)
+    return definitions
+
+def create_html(grid: List[List[str]], placed_words: List[Tuple[str, int, int, str]], definitions: Dict[str, Dict[int, str]], output_filename: str):
+    """Generates the interactive HTML file for the crossword."""
+    try:
+        with open("template.html", "r", encoding="utf-8") as template_file: #Load from external file
+            template = template_file.read()
+
+        # Create grid HTML
+        grid_html = '<table class="crossword-grid">'
+        for row_index, row in enumerate(grid):
+            grid_html += "<tr>"
+            for col_index, cell in enumerate(row):
+                if cell == "#":
+                    grid_html += '<td class="black"></td>'
+                else:
+                    # Find the word (if any) that occupies this cell
+                    word_info = None
+                    for word, word_row, word_col, direction in placed_words:
+                        if direction == "across" and row_index == word_row and word_col <= col_index < word_col + len(word):
+                            word_info = (word, word_row, word_col, direction, col_index - word_col)
+                            break
+                        elif direction == "down" and col_index == word_col and word_row <= row_index < word_row + len(word):
+                            word_info = (word, word_row, word_col, direction, row_index - word_row)
+                            break
+
+                    if word_info:  # Cell is part of a word
+                        word, word_row, word_col, direction, index_in_word = word_info
+                        cell_id = f"{word_row}-{word_col}-{direction}"
+                        if index_in_word == 0:  # First letter of the word
+                            # Get the correct number
+                            slots = [(word, row, col, direction) for word, row, col, direction in placed_words]
+                            cell_numbers = order_cell_numbers(slots)
+
+                            number = cell_numbers.get((word_row, word_col, direction), "")  # Get cell number
+                            grid_html += (
+                                f'<td class="white" id="{cell_id}">'
+                                f'<div class="cell-container">'
+                                f'<span class="number">{number}</span>'
+                                f'<input type="text" maxlength="1" class="letter" data-row="{row_index}" data-col="{col_index}" data-direction="{direction}">'
+                                f'</div>'
+                                f"</td>"
+                            )
+
+                        else:
+                            grid_html += (
+                                f'<td class="white" id="{cell_id}-{index_in_word}">'
+                                 f'<div class="cell-container">'
+                                f'<input type="text" maxlength="1" class="letter" data-row="{row_index}" data-col="{col_index}" data-direction="{direction}">'
+                                 f'</div>'
+                                f"</td>"
+                            )
+                    else:
+                        grid_html += '<td class="white"></td>'  # Empty cell
+            grid_html += "</tr>"
+        grid_html += "</table>"
+
+        # Create definitions HTML
+        definitions_html = '<div class="definitions">'
+        for direction, clues in definitions.items():
+            definitions_html += f'<h3>{direction.capitalize()}</h3><ol>'
+            for clue, definition in clues.items():
+                definitions_html += f'<li><span class="clue-number">{clue.split(".")[0]}.</span> {definition}</li>'
+            definitions_html += '</ol>'
+        definitions_html += '</div>'
+
+        # Combine into the template
+        final_html = template.format(grid_html=grid_html, definitions_html=definitions_html)
+
+        with open(output_filename, "w", encoding="utf-8") as output_file:
+            output_file.write(final_html)
+
+    except FileNotFoundError:
+        logging.error("Could not find template.html. Please make sure it exists in the same directory.")
+        sys.exit(1)
+    except Exception as e:
+        logging.error(f"An error occurred while generating HTML: {e}")
+        sys.exit(1)
 
 
 def main():
     """Main function to parse arguments and run crossword generation."""
-    parser = argparse.ArgumentParser(
-        description="Generates an interactive crossword puzzle."
-    )
-    parser.add_argument(
-        "--width",
-        type=int,
-        default=DEFAULT_GRID_WIDTH,
-        help="Width of grid (columns).",
-    )
-    parser.add_argument(
-        "--height",
-        type=int,
-        default=DEFAULT_GRID_HEIGHT,
-        help="Height of grid (rows).",
-    )
-    parser.add_argument(
-        "--black_squares",
-        type=float,
-        default=DEFAULT_BLACK_SQUARE_RATIO,
-        help="Approximate % of black squares (0.0 to 1.0).",
-    )
-    parser.add_argument(
-        "--manual_grid",
-        type=str,
-        default=None,
-        help="Manually specify grid ('.'=white, '#'=black).",
-    )
-    parser.add_argument(
-        "--grid_file",
-        type=str,
-        default=None,
-        help="Path to file with grid layout.",
-    )
-    parser.add_argument(
-        "--lm_studio_url",
-        type=str,
-        default=DEFAULT_LM_STUDIO_URL,
-        help="LM Studio server URL.",
-    )
-    parser.add_argument(
-        "--words_file",
-        type=str,
-        default=DEFAULT_WORDS_FILE,
-        help="Path to words file (one word per line).",
-    )
-    parser.add_argument(
-        "--output_filename",
-        type=str,
-        default=DEFAULT_OUTPUT_FILENAME,
-        help="Output HTML filename.",
-    )
-    parser.add_argument(
-        "--max_attempts",
-        type=int,
-        default=DEFAULT_MAX_ATTEMPTS,
-        help="Max attempts to place a word.",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=DEFAULT_TIMEOUT,
-        help="Timeout for word selection (seconds).",
-    )
-    parser.add_argument(
-        "--llm_timeout",
-        type=int,
-        default=DEFAULT_LLM_TIMEOUT,
-        help="Timeout for LLM requests (seconds).",
-    )
-    parser.add_argument(
-        "--llm_max_tokens",
-        type=int,
-        default=DEFAULT_LLM_MAX_TOKENS,
-        help="Max tokens for LLM responses.",
-    )
-    parser.add_argument(
-        "--language",
-        type=str,
-        default=DEFAULT_LANGUAGE,
-        help="Language for definitions.",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=DEFAULT_MODEL,
-        help="Model name to use for definitions.",
-    )
-    parser.add_argument(
-        "--max_grid_iterations",
-        type=int,
-        default=DEFAULT_MAX_GRID_ITERATIONS,
-        help="Maximum number of attempts to generate a complete grid.",
-    )
+    parser = argparse.ArgumentParser(description="Generates an interactive crossword puzzle.")
+    parser.add_argument("--width", type=int, default=DEFAULT_GRID_WIDTH, help="Width of grid (columns).")
+    parser.add_argument("--height", type=int, default=DEFAULT_GRID_HEIGHT, help="Height of grid (rows).")
+    parser.add_argument("--black_squares", type=float, default=DEFAULT_BLACK_SQUARE_RATIO, help="Approximate % of black squares (0.0 to 1.0).")
+    parser.add_argument("--manual_grid", type=str, default=None, help="Manually specify grid ('.'=white, '#'=black).")
+    parser.add_argument("--grid_file", type=str, default=None, help="Path to file with grid layout.")
+    parser.add_argument("--lm_studio_url", type=str, default=DEFAULT_LM_STUDIO_URL, help="LM Studio server URL.")
+    parser.add_argument("--words_file", type=str, default=DEFAULT_WORDS_FILE, help="Path to words file (one word per line).")
+    parser.add_argument("--output_filename", type=str, default=DEFAULT_OUTPUT_FILENAME, help="Output HTML filename.")
+    parser.add_argument("--max_attempts", type=int, default=DEFAULT_MAX_ATTEMPTS, help="Max attempts to place a word.")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Timeout for word selection (seconds).")
+    parser.add_argument("--llm_timeout", type=int, default=DEFAULT_LLM_TIMEOUT, help="Timeout for LLM requests (seconds).")
+    parser.add_argument("--llm_max_tokens", type=int, default=DEFAULT_LLM_MAX_TOKENS, help="Max tokens for LLM responses.")
+    parser.add_argument("--language", type=str, default=DEFAULT_LANGUAGE, help="Language for definitions.")
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL, help="Model name to use for definitions.")
+    parser.add_argument("--max_grid_iterations", type=int, default=5, help="Maximum number of attempts to generate a complete grid.") #Added to the args
 
     args = parser.parse_args()
 
-     # Input validation
-    if args.width <= 0 or args.height <= 0:
-        logging.error("Width and height must be positive integers.")
+    # --- Input Validation (Comprehensive) ---
+    if not all(isinstance(arg, int) and arg > 0 for arg in [args.width, args.height, args.max_attempts, args.timeout, args.llm_timeout, args.llm_max_tokens, args.max_grid_iterations]):
+        logging.error("Width, height, max_attempts, timeout, llm_timeout, llm_max_tokens and max_grid_iterations must be positive integers.")
         sys.exit(1)
     if not 0.0 <= args.black_squares <= 1.0:
         logging.error("black_squares must be between 0.0 and 1.0.")
         sys.exit(1)
-    if args.max_attempts <=0 or args.timeout <= 0 or args.llm_timeout <= 0 or args.llm_max_tokens <= 0:
-        logging.error("All timeout and max_attempts values need to be positive integers")
-        sys.exit(1)
-    if args.max_grid_iterations <= 0:
-        logging.error("max_grid_iterations must be positive")
+    if args.manual_grid and args.grid_file:
+        logging.error("Cannot specify both --manual_grid and --grid_file.")
         sys.exit(1)
 
-    llm = setup_langchain_llm(
-        args.lm_studio_url, 
-        args.llm_timeout, 
-        args.llm_max_tokens,
-        args.model
-    )
-
-    words_by_length = load_words(args.words_file)
+    # --- Load Words and Calculate Frequencies ---
+    words_by_length, word_frequencies = load_words(args.words_file)
     if not words_by_length:
         logging.error("No valid words found in the word file.")
         sys.exit(1)
 
-    # Try multiple times to generate a valid grid
-    filled_grid = None
-    placed_words = None
-    iteration = 0
+    # --- Setup LLM ---
+    llm = setup_langchain_llm(args.lm_studio_url, args.llm_timeout, args.llm_max_tokens, args.model)
 
-    while filled_grid is None and iteration < args.max_grid_iterations:
-        iteration += 1
-        logging.info(f"\nAttempt {iteration} to generate grid...")
-        
-        grid = generate_grid(
-            args.width, args.height, args.black_squares, 
-            args.manual_grid, args.grid_file
-        )
-        
-        print("\nInitial grid configuration:")
-        print_grid(grid)
-        
+    # --- Main Generation Loop ---
+    console = Console()  # Initialize Rich Console
+    for attempt in range(args.max_grid_iterations):
+        console.print(f"\n[bold blue]Attempting to generate crossword (Attempt {attempt + 1}/{args.max_grid_iterations})[/]")
+        grid = generate_grid(args.width, args.height, args.black_squares, args.manual_grid, args.grid_file)
+
+        if not is_valid_grid(grid): #Validate grid
+            console.print("[red]Invalid grid generated. Retrying...[/]")
+            continue
+
+        console.print("[green]Initial Grid:[/]")
+        print_grid(grid, console=console)
+
         slots = find_slots(grid)
-        if len(slots) < 2:
-            logging.warning("Grid has insufficient slots, retrying...")
-            continue
-
-        # Check for impossible grids early
-        impossible = False
-        for _, _, _, length in slots:
-            if length not in words_by_length:
-                logging.warning(f"No words of length {length} found, retrying...")
-                impossible = True
-                break
-        if impossible:
-            continue
+        if not slots:
+             console.print("[red]No valid slots found in the grid. Retrying...[/]")
+             continue
 
         with Progress() as progress:
-            task_select_words = progress.add_task("[yellow]Selecting Words...")
-            filled_grid, placed_words = select_words(
-                grid, slots, words_by_length, 
-                progress, task_select_words, args.timeout
-            )
-            progress.stop()
+            task = progress.add_task("[cyan]Selecting words and generating crossword...", total=None)  # Indeterminate progress
+            filled_grid, placed_words = select_words(grid, slots, words_by_length, word_frequencies, progress, task)
+            progress.update(task,completed=100) #Complete the task
 
-    if filled_grid is not None:
-        definitions = generate_definitions(placed_words, llm, args.language)
-        create_html(filled_grid, placed_words, definitions, args.output_filename)
-        print(f"Crossword puzzle created and saved to {args.output_filename}")
+        if filled_grid is not None:
+            console.print("[green]Crossword filled successfully![/]")
+            print_grid(filled_grid,placed_words, console)
+
+            definitions = generate_definitions(placed_words, llm, args.language)
+            create_html(filled_grid, placed_words, definitions, args.output_filename)
+            console.print(f"[green]Crossword puzzle saved to: {args.output_filename}[/]")
+            console.print(stats.get_summary()) # Show stats
+            break  # Exit loop on success
+        else:
+            console.print("[yellow]Failed to fill the grid completely. Retrying with a new grid...[/]")
+            console.print(stats.get_summary()) #Show stats
     else:
-        print("Failed to generate a complete crossword puzzle.")
-
+        console.print("[red]Failed to generate a complete crossword after multiple attempts.[/]")
 
 if __name__ == "__main__":
     main()
