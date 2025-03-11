@@ -30,6 +30,8 @@ DEFAULT_TIMEOUT = 60
 DEFAULT_LLM_TIMEOUT = 30
 DEFAULT_LLM_MAX_TOKENS = 48
 DEFAULT_LANGUAGE = "Italian"
+DEFAULT_MODEL = "meta-llama-3.1-8b-instruct"
+DEFAULT_MAX_GRID_ITERATIONS = 5
 MAX_RECURSION_DEPTH = 100  # Prevent stack overflow
 
 # Setup logging
@@ -44,7 +46,10 @@ NON_ALPHANUMERIC_RE = re.compile(r"^[^\w]+|[^\w]+$")
 
 
 def setup_langchain_llm(
-    lm_studio_url: str, llm_timeout: int, llm_max_tokens: int
+    lm_studio_url: str, 
+    llm_timeout: int, 
+    llm_max_tokens: int,
+    model: str
 ) -> ChatOpenAI:
     """
     Sets up the LangChain LLM (ChatOpenAI) with retries and timeout.
@@ -53,6 +58,7 @@ def setup_langchain_llm(
         lm_studio_url: The URL of the LM Studio instance.
         llm_timeout: Timeout for LLM requests in seconds.
         llm_max_tokens: Maximum number of tokens for the LLM response.
+        model: Model name to use.
 
     Returns:
         A ChatOpenAI instance.
@@ -61,7 +67,7 @@ def setup_langchain_llm(
         llm = ChatOpenAI(
             base_url=lm_studio_url,
             api_key="NA",  # API key is not needed for local models
-            model="meta-llama-3.1-8b-instruct",  # Or other compatible
+            model=model,
             temperature=0.7,
             max_tokens=llm_max_tokens,
             timeout=llm_timeout,
@@ -779,6 +785,18 @@ def main():
         default=DEFAULT_LANGUAGE,
         help="Language for definitions.",
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=DEFAULT_MODEL,
+        help="Model name to use for definitions.",
+    )
+    parser.add_argument(
+        "--max_grid_iterations",
+        type=int,
+        default=DEFAULT_MAX_GRID_ITERATIONS,
+        help="Maximum number of attempts to generate a complete grid.",
+    )
 
     args = parser.parse_args()
 
@@ -792,35 +810,58 @@ def main():
     if args.max_attempts <=0 or args.timeout <= 0 or args.llm_timeout <= 0 or args.llm_max_tokens <= 0:
         logging.error("All timeout and max_attempts values need to be positive integers")
         sys.exit(1)
+    if args.max_grid_iterations <= 0:
+        logging.error("max_grid_iterations must be positive")
+        sys.exit(1)
 
-    llm = setup_langchain_llm(args.lm_studio_url, args.llm_timeout, args.llm_max_tokens)
+    llm = setup_langchain_llm(
+        args.lm_studio_url, 
+        args.llm_timeout, 
+        args.llm_max_tokens,
+        args.model
+    )
 
     words_by_length = load_words(args.words_file)
     if not words_by_length:
         logging.error("No valid words found in the word file.")
         sys.exit(1)
 
-    grid = generate_grid(
-        args.width, args.height, args.black_squares, args.manual_grid, args.grid_file
-    )
-    # Check if grid has at least two slots
-    slots = find_slots(grid)
-    if len(slots) < 2:
-        logging.error("The generated grid does not have enough valid slots. Please adjust grid parameters.")
-        sys.exit(1)
+    # Try multiple times to generate a valid grid
+    filled_grid = None
+    placed_words = None
+    iteration = 0
 
-    # Check for impossible grids early
-    for _, _, _, length in slots:
-        if length not in words_by_length:
-            logging.error(f"No words of length {length} found. Grid is unsolvable.")
-            sys.exit(1)
-
-    with Progress() as progress:
-        task_select_words = progress.add_task("[yellow]Selecting Words...")
-        filled_grid, placed_words = select_words(
-            grid, slots, words_by_length, progress, task_select_words, args.timeout
+    while filled_grid is None and iteration < args.max_grid_iterations:
+        iteration += 1
+        logging.info(f"Attempt {iteration} to generate grid...")
+        
+        grid = generate_grid(
+            args.width, args.height, args.black_squares, 
+            args.manual_grid, args.grid_file
         )
-        progress.stop()
+        
+        slots = find_slots(grid)
+        if len(slots) < 2:
+            logging.warning("Grid has insufficient slots, retrying...")
+            continue
+
+        # Check for impossible grids early
+        impossible = False
+        for _, _, _, length in slots:
+            if length not in words_by_length:
+                logging.warning(f"No words of length {length} found, retrying...")
+                impossible = True
+                break
+        if impossible:
+            continue
+
+        with Progress() as progress:
+            task_select_words = progress.add_task("[yellow]Selecting Words...")
+            filled_grid, placed_words = select_words(
+                grid, slots, words_by_length, 
+                progress, task_select_words, args.timeout
+            )
+            progress.stop()
 
     if filled_grid is not None:
         definitions = generate_definitions(placed_words, llm, args.language)
