@@ -554,46 +554,85 @@ def try_slot(grid: List[List[str]], slot: Tuple[int, int, str, int], word: str,
              progress: Progress, task: TaskID,
              config: Config,  # Pass config
              ) -> Tuple[Optional[List[List[str]]], Optional[List[Tuple[str, int, int, str]]]]:
-    """Tries to place a word and continues recursively (no threading)."""
+    """Tries to place a word with enhanced validation and caching."""
     row, col, direction, length = slot
 
+    # Check placement cache first
+    cache_key = f"{word}_{row}_{col}_{direction}"
+    with cache_lock:
+        if cache_key in placement_cache:
+            if not placement_cache[cache_key]:
+                return None, None
+
+    # Validate placement with enhanced constraints
     if not validate_placement(grid, slot, word, remaining_slots, words_by_length):
+        with cache_lock:
+            placement_cache[cache_key] = False
         return None, None
 
+    # Make placement and update cache
     new_grid, new_placed_words = make_placement(grid, slot, word, placed_words)
+    with cache_lock:
+        placement_cache[cache_key] = True
+
+    # Try to solve remaining slots with optimized recursion
     result = select_words_recursive(new_grid, remaining_slots, words_by_length,
-                                    word_frequencies, new_placed_words, progress,
-                                    task, config, None) # Pass config
+                                  word_frequencies, new_placed_words, progress,
+                                  task, config, None, depth=0)
     if result[0] is not None:
+        stats.successful_placements += 1
         return result
 
+    # Handle backtrack with improved statistics
     handle_backtrack(slot)
+    stats.failed_placements += 1
     return None, None
 
 
 def get_location_score(grid: List[List[str]], slot: Tuple[int, int, str, int]) -> float:
-    """Calculates a score based on slot location."""
+    """Calculates a score based on slot location and potential intersections."""
     row, col, direction, length = slot
     height, width = len(grid), len(grid[0])
 
+    # Center proximity bonus (words near center are preferred)
     center_row, center_col = height // 2, width // 2
     distance_to_center = abs(row - center_row) + abs(col - center_col)
     center_bonus = 1.0 - (distance_to_center / (height + width))
 
+    # Length bonus (longer words create more intersection opportunities)
     length_bonus = length / max(height, width)
 
+    # Intersection potential bonus
     crossing_slots = 0
+    potential_intersections = 0
     if direction == "across":
         for i in range(length):
+            # Count existing crossing points
             if any(grid[r][col + i] == "." for r in range(height)):
                 crossing_slots += 1
+            # Count potential future intersections
+            empty_spaces = sum(1 for r in range(height) if grid[r][col + i] == ".")
+            potential_intersections += empty_spaces
     else:
         for i in range(length):
             if any(grid[row + i][c] == "." for c in range(width)):
                 crossing_slots += 1
-    intersection_bonus = crossing_slots / length
+            empty_spaces = sum(1 for c in range(width) if grid[row + i][c] == ".")
+            potential_intersections += empty_spaces
 
-    return (center_bonus * 0.4 + length_bonus * 0.3 + intersection_bonus * 0.3)
+    intersection_bonus = (crossing_slots + 0.5 * potential_intersections) / (length * 2)
+
+    # Edge penalty (avoid placing words at edges unless necessary)
+    edge_penalty = 0.0
+    if row == 0 or row + (length if direction == "down" else 1) >= height:
+        edge_penalty += 0.2
+    if col == 0 or col + (length if direction == "across" else 1) >= width:
+        edge_penalty += 0.2
+
+    return (center_bonus * 0.3 + 
+            length_bonus * 0.2 + 
+            intersection_bonus * 0.4 - 
+            edge_penalty * 0.1)
 
 
 
@@ -606,11 +645,16 @@ def select_words_recursive(
         progress: Progress,
         task: TaskID,
         config: Config,  # Pass config
-        executor: Optional[ThreadPoolExecutor] = None
+        executor: Optional[ThreadPoolExecutor] = None,
+        depth: int = 0
 ) -> Tuple[Optional[List[List[str]]], Optional[List[Tuple[str, int, int, str]]]]:
-    """Recursively selects words, with backtracking and threading."""
+    """Recursively selects words, with enhanced backtracking and parallel processing."""
     stats.attempts += 1
     stats.update_time()
+
+    # Early termination for deep recursion
+    if depth > len(slots) * 2:
+        return None, None
 
     if stats.time_spent > config.timeout:  # Use config.timeout
         return None, None
@@ -620,6 +664,30 @@ def select_words_recursive(
             return grid, placed_words
         return None, None
 
+    # If we've backtracked too many times, try filling impossible spaces with black squares
+    if stats.backtracks > 50 and depth > 0 and depth % 10 == 0:
+        new_grid, new_slots = fill_impossible_spaces(grid, slots, words_by_length)
+        if new_grid != grid:  # If the grid was modified
+            logging.info(f"Filled impossible spaces with black squares at depth {depth}. Slots before: {len(slots)}, after: {len(new_slots)}")
+            # Try with the new grid and slots
+            result = select_words_recursive(new_grid, new_slots, words_by_length, word_frequencies, 
+                                          placed_words, progress, task, config, executor, depth + 1)
+            if result[0] is not None:
+                return result
+    
+    # If we're getting close to filling the grid but stuck (few slots left but many backtracks),
+    # try more aggressive black square filling
+    if len(slots) < 10 and stats.backtracks > 100:
+        logging.info(f"Trying aggressive black square filling with {len(slots)} slots left and {stats.backtracks} backtracks")
+        new_grid, new_slots = final_fill_impossible_spaces(grid, slots, words_by_length, config)
+        if new_grid != grid:  # If the grid was modified
+            logging.info(f"Aggressively filled impossible spaces with black squares. Slots before: {len(slots)}, after: {len(new_slots)}")
+            # Try with the new grid and slots
+            result = select_words_recursive(new_grid, new_slots, words_by_length, word_frequencies, 
+                                          placed_words, progress, task, config, executor, depth + 1)
+            if result[0] is not None:
+                return result
+
     scored_slots = []
     for slot in slots:
         base_score = get_slot_score(grid, slot, words_by_length, placed_words)
@@ -628,10 +696,18 @@ def select_words_recursive(
         scored_slots.append((total_score, slot))
     scored_slots.sort(key=lambda x: x[0], reverse=True)
 
-    if stats.backtracks > 100 and stats.dynamic_beam_width < 50:
-        stats.dynamic_beam_width += 2
-    if stats.backtracks > 200 and stats.dynamic_max_backtrack < 1000:
-         stats.dynamic_max_backtrack += 50
+    # Adaptive parameter adjustment based on search progress
+    if stats.backtracks > 50 and stats.dynamic_beam_width < 50:
+        stats.dynamic_beam_width += 3  # More aggressive beam width increase
+    if stats.backtracks > 100 and stats.dynamic_max_backtrack < 1000:
+        stats.dynamic_max_backtrack += 100  # More aggressive backtrack limit
+    
+    # Reset parameters if we're making good progress
+    if stats.successful_placements > 0 and stats.successful_placements % 5 == 0:
+        if stats.dynamic_beam_width > DEFAULT_BEAM_WIDTH:
+            stats.dynamic_beam_width = max(DEFAULT_BEAM_WIDTH, stats.dynamic_beam_width - 1)
+        if stats.dynamic_max_backtrack > DEFAULT_MAX_BACKTRACK:
+            stats.dynamic_max_backtrack = max(DEFAULT_MAX_BACKTRACK, stats.dynamic_max_backtrack - 25)
 
     for score, slot in scored_slots[:stats.dynamic_beam_width]:
         row, col, direction, length = slot
@@ -913,8 +989,267 @@ def main():
         else:
             console.print("[yellow]Failed to fill grid. Retrying...[/]")
             console.print(stats.get_summary())
+            
+            # Last resort: try aggressive black cell filling if this is the last attempt
+            if attempt == config.max_grid_iterations - 1:  # On the last attempt
+                console.print("[cyan]Trying aggressive black cell filling as a last resort...[/]")
+                # Apply aggressive black cell filling
+                modified_grid, modified_slots = final_fill_impossible_spaces(grid, slots, words_by_length, config)
+                
+                if modified_grid != grid:  # If the grid was modified
+                    console.print("[green]Grid modified with aggressive black cell filling. Trying again...[/]")
+                    print_grid(modified_grid, console=console)
+                    console.print(f"[blue]Slots reduced from {len(slots)} to {len(modified_slots)}[/]")
+                    
+                    # Try filling the modified grid
+                    with Progress() as progress:
+                        task = progress.add_task("[cyan]Filling modified grid...", total=None)
+                        filled_grid, placed_words = select_words(modified_grid, modified_slots, words_by_length, 
+                                                                 word_frequencies, progress, task, config)
+                        progress.update(task, completed=100)
+                    
+                    if filled_grid is not None:
+                        console.print("[green]Crossword filled after aggressive black cell filling![/]")
+                        print_grid(filled_grid, placed_words, console)
+                        definitions = generate_definitions(placed_words, config.language, config)
+                        create_html(filled_grid, placed_words, definitions, config.output_filename)
+                        console.print(f"[green]Saved to: {config.output_filename}[/]")
+                        console.print(stats.get_summary())
+                        break
     else:
         console.print("[red]Failed to generate crossword.[/]")
+
+
+def fill_impossible_spaces(grid: List[List[str]], slots: List[Tuple[int, int, str, int]], words_by_length: Dict[int, List[str]], config: Config, aggressive: bool = False) -> Tuple[List[List[str]], List[Tuple[int, int, str, int]]]:
+    """Identifies and fills impossible or difficult-to-fill slots with black squares.
+    Returns the modified grid and the updated slots list."""
+    height, width = len(grid), len(grid[0])
+    modified = False
+    
+    # Create a copy of the grid
+    new_grid = [row[:] for row in grid]
+    
+    # Score each slot by how constrained it is
+    slot_scores = []
+    for slot in slots:
+        row, col, direction, length = slot
+        
+        # Get the current pattern
+        if direction == "across":
+            pattern = "".join(grid[row][col:col + length])
+        else:
+            pattern = "".join(grid[row + i][col] for i in range(length))
+        
+        pattern = create_pattern(pattern)
+        possible_words = len(word_index.get((length, pattern), []))
+        
+        # If no words can fit, this is an impossible slot
+        if possible_words == 0:
+            slot_scores.append((0, slot))
+        else:
+            # Lower score means more constrained
+            slot_scores.append((possible_words, slot))
+    
+    # Sort by constraint level (most constrained first)
+    slot_scores.sort(key=lambda x: x[0])
+    
+    # Try to fill the most constrained slots with black squares
+    for score, slot in slot_scores:
+        # In aggressive mode, consider slots with more options
+        if not aggressive and score > 5:  # Skip slots that have enough options
+            continue
+        # In aggressive mode, consider slots with up to 20 options
+        elif aggressive and score > 20:
+            continue
+            
+        row, col, direction, length = slot
+        
+        # For very constrained slots, consider adding black squares
+        if direction == "across":
+            # Check if we can place a black square at the start or end
+            positions_to_try = [(row, col), (row, col + length - 1)]
+        else:
+            positions_to_try = [(row, col), (row + length - 1, col)]
+            
+        for pos_row, pos_col in positions_to_try:
+            # Skip if already a black square
+            if new_grid[pos_row][pos_col] == "#":
+                continue
+                
+            # Place black square symmetrically
+            def place_symmetrically(r: int, c: int):
+                new_grid[r][c] = "#"
+                new_grid[height - 1 - r][width - 1 - c] = "#"
+                
+            # Check if placing a black square would create a 2x2 block
+            def would_create_2x2_block(r: int, c: int) -> bool:
+                # Check all four possible 2x2 configurations that include this position
+                if (r > 0 and c > 0 and 
+                    new_grid[r-1][c] == "#" and new_grid[r][c-1] == "#" and new_grid[r-1][c-1] == "#"):
+                    return True
+                if (r > 0 and c < width - 1 and 
+                    new_grid[r-1][c] == "#" and new_grid[r][c+1] == "#" and new_grid[r-1][c+1] == "#"):
+                    return True
+                if (r < height - 1 and c > 0 and 
+                    new_grid[r+1][c] == "#" and new_grid[r][c-1] == "#" and new_grid[r+1][c-1] == "#"):
+                    return True
+                if (r < height - 1 and c < width - 1 and 
+                    new_grid[r+1][c] == "#" and new_grid[r][c+1] == "#" and new_grid[r+1][c+1] == "#"):
+                    return True
+                return False
+            
+            # Check if placing a black square would isolate any white squares
+            def would_isolate_squares(r: int, c: int) -> bool:
+                # Check the four adjacent cells
+                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < height and 0 <= nc < width and new_grid[nr][nc] == ".":
+                        # Count connections for this adjacent cell
+                        connections = 0
+                        for adr, adc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                            anr, anc = nr + adr, nc + adc
+                            if 0 <= anr < height and 0 <= anc < width and (anr, anc) != (r, c) and new_grid[anr][anc] == ".":
+                                connections += 1
+                        if connections == 0:  # This would isolate the cell
+                            return True
+                return False
+            
+            # Check if we can place a black square here
+            if not would_create_2x2_block(pos_row, pos_col) and not would_isolate_squares(pos_row, pos_col):
+                # Place the black square symmetrically
+                place_symmetrically(pos_row, pos_col)
+                modified = True
+                break  # Only make one modification at a time
+                
+        if modified:
+            break
+    
+    # If we modified the grid, recalculate the slots
+    if modified:
+        new_slots = find_slots(new_grid, config)
+        return new_grid, new_slots
+    
+    return grid, slots
+
+
+def final_fill_impossible_spaces(grid: List[List[str]], slots: List[Tuple[int, int, str, int]], words_by_length: Dict[int, List[str]], config: Config) -> Tuple[List[List[str]], List[Tuple[int, int, str, int]]]:
+    """More aggressive version of fill_impossible_spaces to be used at the end of generation.
+    This function is designed to be called when the grid is nearly complete but has a few
+    difficult-to-fill slots remaining. It will be more aggressive in placing black squares."""
+    
+    # First try the regular fill_impossible_spaces with aggressive mode
+    new_grid, new_slots = fill_impossible_spaces(grid, slots, words_by_length, config, aggressive=True)
+    
+    # If that didn't change anything, try even more aggressive approaches
+    if new_grid == grid:
+        height, width = len(grid), len(grid[0])
+        modified = False
+        
+        # Create a copy of the grid
+        new_grid = [row[:] for row in grid]
+        
+        # For each remaining slot, calculate how many valid words can fit
+        slot_options = []
+        for slot in slots:
+            row, col, direction, length = slot
+            
+            # Get the current pattern
+            if direction == "across":
+                pattern = "".join(grid[row][col:col + length])
+            else:
+                pattern = "".join(grid[row + i][col] for i in range(length))
+            
+            pattern = create_pattern(pattern)
+            possible_words = word_index.get((length, pattern), [])
+            
+            # Store the number of options for this slot
+            slot_options.append((len(possible_words), slot))
+        
+        # Sort by number of options (fewest first)
+        slot_options.sort()
+        
+        # For slots with very few options, try more aggressive black square placement
+        for options, slot in slot_options:
+            if options > 30:  # Skip slots with plenty of options
+                continue
+                
+            row, col, direction, length = slot
+            
+            # Try placing black squares at strategic positions within the slot
+            positions_to_try = []
+            
+            if direction == "across":
+                # Try positions along the slot
+                for i in range(length):
+                    positions_to_try.append((row, col + i))
+            else:
+                # Try positions along the slot
+                for i in range(length):
+                    positions_to_try.append((row + i, col))
+                    
+            # Prioritize positions that would split the slot into more manageable pieces
+            if length > 4:
+                # For longer slots, try placing black squares in the middle first
+                positions_to_try.sort(key=lambda pos: abs(pos[0] - row - length//2 if direction == "down" else abs(pos[1] - col - length//2)))
+            
+            for pos_row, pos_col in positions_to_try:
+                # Skip if already a black square
+                if new_grid[pos_row][pos_col] == "#":
+                    continue
+                    
+                # Place black square symmetrically
+                def place_symmetrically(r: int, c: int):
+                    new_grid[r][c] = "#"
+                    new_grid[height - 1 - r][width - 1 - c] = "#"
+                    
+                # Check if placing a black square would create a 2x2 block
+                def would_create_2x2_block(r: int, c: int) -> bool:
+                    # Check all four possible 2x2 configurations that include this position
+                    if (r > 0 and c > 0 and 
+                        new_grid[r-1][c] == "#" and new_grid[r][c-1] == "#" and new_grid[r-1][c-1] == "#"):
+                        return True
+                    if (r > 0 and c < width - 1 and 
+                        new_grid[r-1][c] == "#" and new_grid[r][c+1] == "#" and new_grid[r-1][c+1] == "#"):
+                        return True
+                    if (r < height - 1 and c > 0 and 
+                        new_grid[r+1][c] == "#" and new_grid[r][c-1] == "#" and new_grid[r+1][c-1] == "#"):
+                        return True
+                    if (r < height - 1 and c < width - 1 and 
+                        new_grid[r+1][c] == "#" and new_grid[r][c+1] == "#" and new_grid[r+1][c+1] == "#"):
+                        return True
+                    return False
+                
+                # Check if placing a black square would isolate any white squares
+                def would_isolate_squares(r: int, c: int) -> bool:
+                    # Check the four adjacent cells
+                    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                        nr, nc = r + dr, c + dc
+                        if 0 <= nr < height and 0 <= nc < width and new_grid[nr][nc] == ".":
+                            # Count connections for this adjacent cell
+                            connections = 0
+                            for adr, adc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                                anr, anc = nr + adr, nc + adc
+                                if 0 <= anr < height and 0 <= anc < width and (anr, anc) != (r, c) and new_grid[anr][anc] == ".":
+                                    connections += 1
+                            if connections == 0:  # This would isolate the cell
+                                return True
+                    return False
+                
+                # Check if we can place a black square here
+                if not would_create_2x2_block(pos_row, pos_col) and not would_isolate_squares(pos_row, pos_col):
+                    # Place the black square symmetrically
+                    place_symmetrically(pos_row, pos_col)
+                    modified = True
+                    break  # Only make one modification at a time
+                    
+            if modified:
+                break
+        
+        # If we modified the grid, recalculate the slots
+        if modified:
+            new_slots = find_slots(new_grid, config)
+    
+    return new_grid, new_slots
 
 if __name__ == "__main__":
     main()
