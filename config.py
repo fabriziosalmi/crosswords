@@ -3,7 +3,7 @@
 # --- Constants ---
 DEFAULT_GRID_WIDTH = 5  # Default grid size
 DEFAULT_GRID_HEIGHT = 5     # Default grid size
-DEFAULT_MAX_GRID_ITERATIONS = 1000  # Added from main()
+DEFAULT_MAX_GRID_ITERATIONS = 10  # Added from main()
 DEFAULT_BLACK_SQUARE_RATIO = 0.2  # Classic NYT ratio
 DEFAULT_LM_STUDIO_URL = "http://localhost:1234/v1"  # LLM Studio URL
 DEFAULT_WORDS_FILE = "data/parole.txt"  # Replace with your word list

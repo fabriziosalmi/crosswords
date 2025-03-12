@@ -35,7 +35,6 @@ definition_cache: Dict[str, str] = {}
 word_index: Dict[Tuple[int, str], List[str]] = defaultdict(list)
 llm = None  # Global LLM object
 
-# REVIEW NOTE: Code reviewed and no critical issues found.
 
 # --- Utility Functions ---
 def print_grid(grid: List[List[str]], placed_words: List[Tuple[str, int, int, str]] = None,
@@ -115,17 +114,28 @@ def load_words(filepath: str, min_word_count: int = 3, config: Config = None) ->
 
 
 def build_word_index(words_by_length: Dict[int, List[str]]):
-    """Builds the word index for efficient lookups."""
+    """Builds the word index for efficient lookups with improved pattern matching."""
     global word_index
     word_index.clear()
 
     for length, words in words_by_length.items():
+        # Add empty pattern for initial placement
+        empty_pattern = "." * length
+        word_index[(length, empty_pattern)].extend(words)  # Add all words for the empty pattern
+
         for word in words:
-            word_index[(length, word)].append(word)  # Add the full word
-            for i in range(1 << length):
-                pattern = "".join(word[j] if (i >> j) & 1 else "." for j in range(length))
-                if pattern != word: # Avoid re-adding
-                  word_index[(length, pattern)].append(word)
+            # Add full word pattern
+            word_index[(length, word)].append(word)
+            # Add partial patterns
+            for i in range(length):
+                for j in range(i + 1, length + 1):
+                    pattern = list(empty_pattern)
+                    for k in range(i, j):
+                        pattern[k] = word[k]
+                    pattern_str = "".join(pattern)
+                    word_index[(length, pattern_str)].append(word)
+
+        logging.info(f"Built index for length {length}: {len(words)} words, {len(word_index)} patterns")
 
 
 # --- LangChain and LLM Setup ---
@@ -420,109 +430,55 @@ def _validate_remaining_slots(grid: List[List[str]], slots: List[Tuple[int, int,
     return True
 
 
-def calculate_intersection_score(grid: List[List[str]], word: str, row: int, col: int, direction: str,
-                                 placed_words: List[Tuple[str, int, int, str]]) -> float:
-    """Calculates intersection score."""
-    intersections = 0
-    score = 0.0
-    length = len(word)
-
-    grid_state = [row[:] for row in grid]
-
-    for i, letter in enumerate(word):
-        if direction == "across":
-            if grid_state[row][col + i] != '.' and grid_state[row][col + i] != letter:
-                return -1.0  # Invalid
-            grid_state[row][col + i] = letter
-        else:
-            if grid_state[row + i][col] != '.' and grid_state[row + i][col] != letter:
-                return -1.0
-            grid_state[row + i][col] = letter
-
-    for placed_word, p_row, p_col, p_dir in placed_words:
-        if direction == "across" and p_dir == "down":
-            if p_col >= col and p_col < col + length and row >= p_row and row < p_row + len(placed_word):
-                intersections += 1
-                score += 1
-        elif direction == "down" and p_dir == "across":
-            if p_row >= row and p_row < row + length and col >= p_col and col < p_col + len(placed_word):
-                intersections += 1
-                score += 1
-
-    return score + intersections * 0.5
-
-def get_slot_score(grid: List[List[str]], slot: Tuple[int, int, str, int], words_by_length: Dict[int, List[str]],
-                   placed_words: List[Tuple[str, int, int, str]]) -> float:
-    """Scores slots based on constrainedness and intersections."""
+def validate_placement(grid: List[List[str]], slot: Tuple[int, int, str, int],
+                     word: str, remaining_slots: List[Tuple[int, int, str, int]],
+                     words_by_length: Dict[int, List[str]]) -> bool:
+    """Validates word placement with enhanced pattern matching."""
     row, col, direction, length = slot
 
-    if direction == "across":
-        pattern = "".join(grid[row][col:col + length])
-    else:
-        pattern = "".join(grid[row + i][col] for i in range(length))
-
-    pattern = create_pattern(pattern)
-    possible_words = len(word_index.get((length, pattern), []))
-
-    if possible_words == 0: return -1.0
-
-    constrainedness_score = 1.0 / possible_words
-    intersection_potential = 0.0
-    for word in word_index.get((length, pattern), []):
-        intersection_potential += calculate_intersection_score(grid, word, row, col, direction, placed_words)
-
-    return constrainedness_score + intersection_potential * 0.1
-
-
-# --- Word Selection (Recursive, Backtracking, Parallelism) ---
-
-class CrosswordStats:
-    """Tracks crossword generation statistics."""
-    def __init__(self):
-        self.attempts = 0
-        self.backtracks = 0
-        self.words_tried = 0
-        self.successful_placements = 0
-        self.failed_placements = 0
-        self.time_spent = 0.0
-        self.start_time = time.time()
-        self.slot_fill_order: List[Tuple[int, int, str]] = []
-        self.definition_failures = 0
-        self.dynamic_beam_width = DEFAULT_BEAM_WIDTH
-        self.dynamic_max_backtrack = DEFAULT_MAX_BACKTRACK
-
-    def update_time(self):
-        self.time_spent = time.time() - self.start_time
-
-    def get_summary(self) -> str:
-        self.update_time()
-        return (
-            "📊 Crossword Generation Stats:\n"
-            f"├── Attempts: {self.attempts}\n"
-            f"├── Backtracks: {self.backtracks}\n"
-            f"├── Words Tried: {self.words_tried}\n"
-            f"├── Successful Placements: {self.successful_placements}\n"
-            f"├── Failed Placements: {self.failed_placements}\n"
-            f"├── Definition Failures: {self.definition_failures}\n"
-            f"├── Dynamic Beam Width: {self.dynamic_beam_width}\n"
-            f"├── Dynamic Max Backtrack: {self.dynamic_max_backtrack}\n"
-            f"├── Success Rate: {self.successful_placements / max(1, self.words_tried) * 100:.2f}%\n"
-            f"└── Time Spent: {self.time_spent:.2f}s\n"
-            f"└── Slots Filled Order: {self.slot_fill_order}"
-        )
-
-stats = CrosswordStats()
-
-
-def validate_placement(grid: List[List[str]], slot: Tuple[int, int, str, int],
-                       word: str, remaining_slots: List[Tuple[int, int, str, int]],
-                       words_by_length: Dict[int, List[str]]) -> bool:
-    """Validates word placement and checks for future issues."""
-    row, col, direction, _ = slot
-    if not _is_valid_cached(grid, word, row, col, direction):
+    # Check if word fits in grid
+    if direction == "across" and col + length > len(grid[0]):
         return False
-    temp_grid = place_word(grid, word, row, col, direction)
-    return _validate_remaining_slots(temp_grid, remaining_slots, words_by_length)
+    if direction == "down" and row + length > len(grid):
+        return False
+
+    # Check if placement conflicts with existing letters
+    if direction == "across":
+        for i, letter in enumerate(word):
+            if grid[row][col + i] not in [".", letter]:
+                return False
+    else:
+        for i, letter in enumerate(word):
+            if grid[row + i][col] not in [".", letter]:
+                return False
+
+    # Create temporary grid with placement
+    temp_grid = [row[:] for row in grid]
+    if direction == "across":
+        for i, letter in enumerate(word):
+            temp_grid[row][col + i] = letter
+    else:
+        for i, letter in enumerate(word):
+            temp_grid[row + i][col] = letter
+
+    # Validate intersecting words
+    for r, c, d, l in remaining_slots:
+        if d == direction:
+            continue
+
+        # Get pattern for intersecting slot
+        if d == "across":
+            pattern = "".join(temp_grid[r][c:c + l])
+        else:
+            pattern = "".join(temp_grid[r + i][c] for i in range(l))
+
+        # Check if pattern has any letters (constraints)
+        if any(ch != "." for ch in pattern):
+            pattern = create_pattern(pattern)
+            if not word_index.get((l, pattern)):
+                return False
+
+    return True
 
 
 def make_placement(grid: List[List[str]], slot: Tuple[int, int, str, int],
@@ -546,7 +502,8 @@ def handle_backtrack(slot: Tuple[int, int, str, int]) -> None:
         stats.slot_fill_order.pop()
 
 
-def try_slot(grid: List[List[str]], slot: Tuple[int, int, str, int], word: str,
+def try_slot(grid: List[List[str]], slot: Tuple[int, int, str, int],
+             word: str,
              remaining_slots: List[Tuple[int, int, str, int]],
              words_by_length: Dict[int, List[str]],
              word_frequencies: Dict[str, float],
@@ -554,8 +511,8 @@ def try_slot(grid: List[List[str]], slot: Tuple[int, int, str, int], word: str,
              progress: Progress, task: TaskID,
              config: Config,  # Pass config
              ) -> Tuple[Optional[List[List[str]]], Optional[List[Tuple[str, int, int, str]]]]:
-    """Tries to place a word with enhanced validation and caching."""
     row, col, direction, length = slot
+    stats.words_tried += 1
 
     # Check placement cache first
     cache_key = f"{word}_{row}_{col}_{direction}"
@@ -571,16 +528,33 @@ def try_slot(grid: List[List[str]], slot: Tuple[int, int, str, int], word: str,
         return None, None
 
     # Make placement and update cache
-    new_grid, new_placed_words = make_placement(grid, slot, word, placed_words)
+    new_grid = [row[:] for row in grid]
+    if direction == "across":
+        for i, letter in enumerate(word):
+            new_grid[row][col + i] = letter
+    else:
+        for i, letter in enumerate(word):
+            new_grid[row + i][col] = letter
+
+    new_placed_words = placed_words + [(word, row, col, direction)]
     with cache_lock:
         placement_cache[cache_key] = True
+
+    # Early validation of remaining slots
+    for next_slot in remaining_slots:
+        r, c, d, l = next_slot
+        pattern = create_pattern("".join(new_grid[r][c:c + l] if d == "across" else [new_grid[r + i][c] for i in range(l)]))
+        valid_words = word_index.get((l, pattern), [])
+        if not valid_words:
+            return None, None
 
     # Try to solve remaining slots with optimized recursion
     result = select_words_recursive(new_grid, remaining_slots, words_by_length,
                                   word_frequencies, new_placed_words, progress,
-                                  task, config, None, depth=0)
+                                  task, config)
     if result[0] is not None:
         stats.successful_placements += 1
+        stats.slot_fill_order.append((row, col, direction))  # Track successful placement
         return result
 
     # Handle backtrack with improved statistics
@@ -591,7 +565,7 @@ def try_slot(grid: List[List[str]], slot: Tuple[int, int, str, int], word: str,
 
 def get_location_score(grid: List[List[str]], slot: Tuple[int, int, str, int]) -> float:
     """Calculates a score based on slot location and potential intersections."""
-    row, col, direction, length = slot
+    row, col, direction, length = slot  # Now takes length
     height, width = len(grid), len(grid[0])
 
     # Center proximity bonus (words near center are preferred)
@@ -629,11 +603,90 @@ def get_location_score(grid: List[List[str]], slot: Tuple[int, int, str, int]) -
     if col == 0 or col + (length if direction == "across" else 1) >= width:
         edge_penalty += 0.2
 
-    return (center_bonus * 0.3 + 
-            length_bonus * 0.2 + 
-            intersection_bonus * 0.4 - 
+    return (center_bonus * 0.3 +
+            length_bonus * 0.2 +
+            intersection_bonus * 0.4 -
             edge_penalty * 0.1)
 
+
+
+def get_slot_length(grid: List[List[str]], row: int, col: int, direction: str) -> int:
+    """Calculates maximum possible word length for a slot."""
+    length = 0
+    if direction == 'across':
+        while col + length < len(grid[row]) and grid[row][col + length] != '#':
+            length += 1
+    else:  # down
+        while row + length < len(grid) and grid[row + length][col] != '#':
+            length += 1
+    return length
+
+
+def count_existing_letters(grid: List[List[str]], slot: Tuple[int, int, str, int]) -> int:
+    """Counts pre-existing letters in a slot."""
+    row, col, direction, _ = slot  # Unpack, ignore length
+    count = 0
+    length = get_slot_length(grid, row, col, direction)
+
+    if direction == 'across':
+        for i in range(length):
+            if grid[row][col + i] != '.':
+                count += 1
+    else:
+        for i in range(length):
+            if grid[row + i][col] != '.':
+                count += 1
+    return count
+
+
+def count_intersections(grid: List[List[str]], slot: Tuple[int, int, str, int], placed_words: List[Tuple[str, int, int, str]]) -> int:
+    """Counts intersecting words from placed words list."""
+    row, col, direction, _ = slot  # Unpack, ignore length
+    intersections = 0
+
+    for word_info in placed_words:
+        w_row, w_col, w_dir = word_info[1], word_info[2], word_info[3]
+        if w_dir == direction:
+            continue  # Same direction can't intersect
+
+        # Check for intersection points
+        if direction == 'across':
+            for i in range(get_slot_length(grid, row, col, direction)):
+                check_row = row
+                check_col = col + i
+                if w_dir == 'down' and (check_row >= w_row and check_row < w_row + len(word_info[0])) and check_col == w_col:
+                    intersections += 1
+        else:
+            for i in range(get_slot_length(grid, row, col, direction)):
+                check_row = row + i
+                check_col = col
+                if w_dir == 'across' and (check_col >= w_col and check_col < w_col + len(word_info[0])) and check_row == w_row:
+                    intersections += 1
+
+    return intersections
+
+def get_slot_score(grid: List[List[str]], slot: Tuple[int, int, str, int], words_by_length: Dict[int, List[str]], placed_words: List[Tuple[str, int, int, str]]) -> float:
+    """Calculates priority score for a slot (higher = better to fill first)."""
+    row, col, direction, length = slot # unpack also length
+    #length = get_slot_length(grid, row, col, direction) # Not needed
+
+    # Base score - prioritize longer words
+    score = length * 10
+
+    # Existing letters bonus
+    existing_letters = count_existing_letters(grid, slot)
+    score += existing_letters * 5
+
+    # Intersection penalty - prefer slots with existing crosses
+    intersections = count_intersections(grid, slot, placed_words)
+    score += intersections * 3
+
+    # Word availability adjustment
+    pattern = create_pattern("".join(grid[row][col:col + length] if direction == "across" else [grid[row + i][col] for i in range(length)]))
+    available = len(word_index.get((length, pattern), []))
+    score *= min(available/100.0, 1.0)  # Penalize if few words available
+
+    return score
 
 
 def select_words_recursive(
@@ -644,19 +697,17 @@ def select_words_recursive(
         placed_words: List[Tuple[str, int, int, str]],
         progress: Progress,
         task: TaskID,
-        config: Config,  # Pass config
+        config: Config,
         executor: Optional[ThreadPoolExecutor] = None,
         depth: int = 0
 ) -> Tuple[Optional[List[List[str]]], Optional[List[Tuple[str, int, int, str]]]]:
-    """Recursively selects words, with enhanced backtracking and parallel processing."""
     stats.attempts += 1
     stats.update_time()
 
-    # Early termination for deep recursion
-    if depth > len(slots) * 2:
+    if depth > len(slots) * 3:
         return None, None
 
-    if stats.time_spent > config.timeout:  # Use config.timeout
+    if stats.time_spent > config.timeout:
         return None, None
 
     if not slots:
@@ -664,94 +715,83 @@ def select_words_recursive(
             return grid, placed_words
         return None, None
 
-    # If we've backtracked too many times, try filling impossible spaces with black squares
-    if stats.backtracks > 50 and depth > 0 and depth % 10 == 0:
-        new_grid, new_slots = fill_impossible_spaces(grid, slots, words_by_length)
-        if new_grid != grid:  # If the grid was modified
-            logging.info(f"Filled impossible spaces with black squares at depth {depth}. Slots before: {len(slots)}, after: {len(new_slots)}")
-            # Try with the new grid and slots
-            result = select_words_recursive(new_grid, new_slots, words_by_length, word_frequencies, 
-                                          placed_words, progress, task, config, executor, depth + 1)
-            if result[0] is not None:
-                return result
-    
-    # If we're getting close to filling the grid but stuck (few slots left but many backtracks),
-    # try more aggressive black square filling
-    if len(slots) < 10 and stats.backtracks > 100:
-        logging.info(f"Trying aggressive black square filling with {len(slots)} slots left and {stats.backtracks} backtracks")
-        new_grid, new_slots = final_fill_impossible_spaces(grid, slots, words_by_length, config)
-        if new_grid != grid:  # If the grid was modified
-            logging.info(f"Aggressively filled impossible spaces with black squares. Slots before: {len(slots)}, after: {len(new_slots)}")
-            # Try with the new grid and slots
-            result = select_words_recursive(new_grid, new_slots, words_by_length, word_frequencies, 
-                                          placed_words, progress, task, config, executor, depth + 1)
-            if result[0] is not None:
-                return result
-
+    # Enhanced slot scoring with debug logging
     scored_slots = []
     for slot in slots:
+        row, col, direction, length = slot
+        # Create pattern correctly for empty slots
+        if direction == "across":
+            pattern = "." * length  # Use empty pattern for initial placement
+        else:
+            pattern = "." * length
+
+        valid_words = word_index.get((length, pattern), [])
+        if not valid_words and any(grid[row][col:col + length]) if direction == "across" else any(grid[row + i][col] for i in range(length)):
+            # If slot has constraints, create pattern from grid
+            pattern = create_pattern("".join(grid[row][col:col + length] if direction == "across" else [grid[row + i][col] for i in range(length)]))
+            valid_words = word_index.get((length, pattern), [])
+
         base_score = get_slot_score(grid, slot, words_by_length, placed_words)
-        location_bonus = get_location_score(grid, slot)
-        total_score = base_score + location_bonus
+        location_bonus = get_location_score(grid, slot) * 2.0
+        constraint_bonus = len(valid_words) / 100.0 if valid_words else 0
+        total_score = base_score + location_bonus - constraint_bonus
+
+        logging.info(f"Slot {slot}: pattern={pattern}, valid_words={len(valid_words)}, score={total_score}")
         scored_slots.append((total_score, slot))
+
     scored_slots.sort(key=lambda x: x[0], reverse=True)
+    logging.info(f"Sorted slots: {[(score, slot) for score, slot in scored_slots]}")
 
-    # Adaptive parameter adjustment based on search progress
-    if stats.backtracks > 50 and stats.dynamic_beam_width < 50:
-        stats.dynamic_beam_width += 3  # More aggressive beam width increase
-    if stats.backtracks > 100 and stats.dynamic_max_backtrack < 1000:
-        stats.dynamic_max_backtrack += 100  # More aggressive backtrack limit
-    
-    # Reset parameters if we're making good progress
-    if stats.successful_placements > 0 and stats.successful_placements % 5 == 0:
-        if stats.dynamic_beam_width > DEFAULT_BEAM_WIDTH:
-            stats.dynamic_beam_width = max(DEFAULT_BEAM_WIDTH, stats.dynamic_beam_width - 1)
-        if stats.dynamic_max_backtrack > DEFAULT_MAX_BACKTRACK:
-            stats.dynamic_max_backtrack = max(DEFAULT_MAX_BACKTRACK, stats.dynamic_max_backtrack - 25)
-
-    for score, slot in scored_slots[:stats.dynamic_beam_width]:
+    for score, slot in scored_slots:
         row, col, direction, length = slot
         remaining_slots = [s for s in slots if s != slot]
 
-        if direction == "across":
-            pattern = "".join(grid[row][col:col + length])
-        else:
-            pattern = "".join(grid[row + i][col] for i in range(length))
-        pattern = create_pattern(pattern)
+        # Get valid words using empty pattern for initial placement
+        pattern = "." * length
         valid_words = word_index.get((length, pattern), [])
+        if not valid_words and any(grid[row][col:col + length]) if direction == "across" else any(grid[row + i][col] for i in range(length)):
+            pattern = create_pattern("".join(grid[row][col:col + length] if direction == "across" else [grid[row + i][col] for i in range(length)]))
+            valid_words = word_index.get((length, pattern), [])
+
+        if not valid_words:
+            logging.info(f"No valid words found for slot {slot} with pattern {pattern}")
+            continue
 
         word_scores = []
-        freq_weight = config.word_frequency_weights[config.difficulty]  # Use config
+        freq_weight = config.word_frequency_weights[config.difficulty]
         for word in valid_words:
-            intersection_score = calculate_intersection_score(grid, word, row, col, direction, placed_words)
+            # No intersection score
             frequency_score = calculate_word_frequency(word, word_frequencies)
-            word_score = (intersection_score * (1 - freq_weight) + (1 - frequency_score) * freq_weight)
+            word_score = frequency_score * freq_weight # Only frequency is used.
             word_scores.append((word_score, word))
-        word_scores.sort(key=lambda x: x[0], reverse=True)
 
-        if executor is not None:  # Top-level: use threading
+        word_scores.sort(key=lambda x: x[0], reverse=True)  # sort by the score.
+        logging.info(f"Trying slot {slot} with {len(word_scores)} words")
+
+        if executor is not None:
             futures = []
             for _, word in word_scores[:stats.dynamic_max_backtrack]:
                 future = executor.submit(try_slot, grid, slot, word,
                                          remaining_slots, words_by_length,
                                          word_frequencies, placed_words,
-                                         progress, task, config)  # Pass config
+                                         progress, task, config)
                 futures.append(future)
 
             for future in as_completed(futures):
                 try:
                     result = future.result()
                     if result[0] is not None:
+                        stats.slot_fill_order.append((row, col, direction))
                         return result
                 except Exception as e:
                     logging.warning(f"Error in thread: {e}")
-
-        else:  # Recursive calls: sequential
+        else:
             for _, word in word_scores[:stats.dynamic_max_backtrack]:
                 result = try_slot(grid, slot, word, remaining_slots,
                                   words_by_length, word_frequencies,
-                                  placed_words, progress, task, config)  # Pass config
+                                  placed_words, progress, task, config)
                 if result[0] is not None:
+                    stats.slot_fill_order.append((row, col, direction))
                     return result
 
     return None, None
@@ -769,7 +809,7 @@ def select_words(
 ) -> Tuple[Optional[List[List[str]]], Optional[List[Tuple[str, int, int, str]]]]:
     """Initializes word selection."""
     global stats
-    stats = CrosswordStats()
+    stats = CrosswordStats()  # Initialize stats here
     stats.start_time = time.time()
     initial_placed_words: List[Tuple[str, int, int, str]] = []
 
@@ -989,25 +1029,25 @@ def main():
         else:
             console.print("[yellow]Failed to fill grid. Retrying...[/]")
             console.print(stats.get_summary())
-            
+
             # Last resort: try aggressive black cell filling if this is the last attempt
             if attempt == config.max_grid_iterations - 1:  # On the last attempt
                 console.print("[cyan]Trying aggressive black cell filling as a last resort...[/]")
                 # Apply aggressive black cell filling
                 modified_grid, modified_slots = final_fill_impossible_spaces(grid, slots, words_by_length, config)
-                
+
                 if modified_grid != grid:  # If the grid was modified
                     console.print("[green]Grid modified with aggressive black cell filling. Trying again...[/]")
                     print_grid(modified_grid, console=console)
                     console.print(f"[blue]Slots reduced from {len(slots)} to {len(modified_slots)}[/]")
-                    
+
                     # Try filling the modified grid
                     with Progress() as progress:
                         task = progress.add_task("[cyan]Filling modified grid...", total=None)
-                        filled_grid, placed_words = select_words(modified_grid, modified_slots, words_by_length, 
+                        filled_grid, placed_words = select_words(modified_grid, modified_slots, words_by_length,
                                                                  word_frequencies, progress, task, config)
                         progress.update(task, completed=100)
-                    
+
                     if filled_grid is not None:
                         console.print("[green]Crossword filled after aggressive black cell filling![/]")
                         print_grid(filled_grid, placed_words, console)
@@ -1020,236 +1060,124 @@ def main():
         console.print("[red]Failed to generate crossword.[/]")
 
 
-def fill_impossible_spaces(grid: List[List[str]], slots: List[Tuple[int, int, str, int]], words_by_length: Dict[int, List[str]], config: Config, aggressive: bool = False) -> Tuple[List[List[str]], List[Tuple[int, int, str, int]]]:
-    """Identifies and fills impossible or difficult-to-fill slots with black squares.
-    Returns the modified grid and the updated slots list."""
-    height, width = len(grid), len(grid[0])
-    modified = False
-    
-    # Create a copy of the grid
+def fill_impossible_spaces(grid: List[List[str]], slots: List[Tuple[int, int, str, int]], words_by_length: Dict[int, List[str]]) -> Tuple[List[List[str]], List[Tuple[int, int, str, int]]]:
     new_grid = [row[:] for row in grid]
-    
-    # Score each slot by how constrained it is
-    slot_scores = []
+    impossible_slots = []
+
     for slot in slots:
         row, col, direction, length = slot
-        
-        # Get the current pattern
         if direction == "across":
             pattern = "".join(grid[row][col:col + length])
         else:
             pattern = "".join(grid[row + i][col] for i in range(length))
-        
+
         pattern = create_pattern(pattern)
-        possible_words = len(word_index.get((length, pattern), []))
-        
-        # If no words can fit, this is an impossible slot
-        if possible_words == 0:
-            slot_scores.append((0, slot))
-        else:
-            # Lower score means more constrained
-            slot_scores.append((possible_words, slot))
-    
-    # Sort by constraint level (most constrained first)
-    slot_scores.sort(key=lambda x: x[0])
-    
-    # Try to fill the most constrained slots with black squares
-    for score, slot in slot_scores:
-        # In aggressive mode, consider slots with more options
-        if not aggressive and score > 5:  # Skip slots that have enough options
-            continue
-        # In aggressive mode, consider slots with up to 20 options
-        elif aggressive and score > 20:
-            continue
-            
-        row, col, direction, length = slot
-        
-        # For very constrained slots, consider adding black squares
-        if direction == "across":
-            # Check if we can place a black square at the start or end
-            positions_to_try = [(row, col), (row, col + length - 1)]
-        else:
-            positions_to_try = [(row, col), (row + length - 1, col)]
-            
-        for pos_row, pos_col in positions_to_try:
-            # Skip if already a black square
-            if new_grid[pos_row][pos_col] == "#":
-                continue
-                
-            # Place black square symmetrically
-            def place_symmetrically(r: int, c: int):
-                new_grid[r][c] = "#"
-                new_grid[height - 1 - r][width - 1 - c] = "#"
-                
-            # Check if placing a black square would create a 2x2 block
-            def would_create_2x2_block(r: int, c: int) -> bool:
-                # Check all four possible 2x2 configurations that include this position
-                if (r > 0 and c > 0 and 
-                    new_grid[r-1][c] == "#" and new_grid[r][c-1] == "#" and new_grid[r-1][c-1] == "#"):
-                    return True
-                if (r > 0 and c < width - 1 and 
-                    new_grid[r-1][c] == "#" and new_grid[r][c+1] == "#" and new_grid[r-1][c+1] == "#"):
-                    return True
-                if (r < height - 1 and c > 0 and 
-                    new_grid[r+1][c] == "#" and new_grid[r][c-1] == "#" and new_grid[r+1][c-1] == "#"):
-                    return True
-                if (r < height - 1 and c < width - 1 and 
-                    new_grid[r+1][c] == "#" and new_grid[r][c+1] == "#" and new_grid[r+1][c+1] == "#"):
-                    return True
-                return False
-            
-            # Check if placing a black square would isolate any white squares
-            def would_isolate_squares(r: int, c: int) -> bool:
-                # Check the four adjacent cells
-                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                    nr, nc = r + dr, c + dc
-                    if 0 <= nr < height and 0 <= nc < width and new_grid[nr][nc] == ".":
-                        # Count connections for this adjacent cell
-                        connections = 0
-                        for adr, adc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                            anr, anc = nr + adr, nc + adc
-                            if 0 <= anr < height and 0 <= anc < width and (anr, anc) != (r, c) and new_grid[anr][anc] == ".":
-                                connections += 1
-                        if connections == 0:  # This would isolate the cell
-                            return True
-                return False
-            
-            # Check if we can place a black square here
-            if not would_create_2x2_block(pos_row, pos_col) and not would_isolate_squares(pos_row, pos_col):
-                # Place the black square symmetrically
-                place_symmetrically(pos_row, pos_col)
-                modified = True
-                break  # Only make one modification at a time
-                
-        if modified:
-            break
-    
-    # If we modified the grid, recalculate the slots
-    if modified:
-        new_slots = find_slots(new_grid, config)
-        return new_grid, new_slots
-    
+        valid_words = word_index.get((length, pattern), [])
+
+        if not valid_words:
+            impossible_slots.append(slot)
+            if direction == "across":
+                for i in range(length):
+                    new_grid[row][col + i] = "#"
+            else:
+                for i in range(length):
+                    new_grid[row + i][col] = "#"
+
+    if impossible_slots:
+        remaining_slots = [s for s in slots if s not in impossible_slots]
+        return new_grid, remaining_slots
     return grid, slots
 
 
-def final_fill_impossible_spaces(grid: List[List[str]], slots: List[Tuple[int, int, str, int]], words_by_length: Dict[int, List[str]], config: Config) -> Tuple[List[List[str]], List[Tuple[int, int, str, int]]]:
-    """More aggressive version of fill_impossible_spaces to be used at the end of generation.
-    This function is designed to be called when the grid is nearly complete but has a few
-    difficult-to-fill slots remaining. It will be more aggressive in placing black squares."""
-    
-    # First try the regular fill_impossible_spaces with aggressive mode
-    new_grid, new_slots = fill_impossible_spaces(grid, slots, words_by_length, config, aggressive=True)
-    
-    # If that didn't change anything, try even more aggressive approaches
-    if new_grid == grid:
-        height, width = len(grid), len(grid[0])
-        modified = False
-        
-        # Create a copy of the grid
-        new_grid = [row[:] for row in grid]
-        
-        # For each remaining slot, calculate how many valid words can fit
-        slot_options = []
-        for slot in slots:
-            row, col, direction, length = slot
-            
-            # Get the current pattern
+def final_fill_impossible_spaces(grid: List[List[str]], slots: List[Tuple[int, int, str, int]],
+                                words_by_length: Dict[int, List[str]], config: Config) -> Tuple[List[List[str]], List[Tuple[int, int, str, int]]]:
+    """More aggressive black cell filling for endgame situations."""
+    new_grid = [row[:] for row in grid]
+    impossible_slots = []
+    difficult_slots = []
+
+    for slot in slots:
+        row, col, direction, length = slot
+        if direction == "across":
+            pattern = "".join(grid[row][col:col + length])
+        else:
+            pattern = "".join(grid[row + i][col] for i in range(length))
+
+        pattern = create_pattern(pattern)
+        valid_words = word_index.get((length, pattern), [])
+
+        if not valid_words:
+            impossible_slots.append(slot)
             if direction == "across":
-                pattern = "".join(grid[row][col:col + length])
+                for i in range(length):
+                    new_grid[row][col + i] = "#"
             else:
-                pattern = "".join(grid[row + i][col] for i in range(length))
-            
-            pattern = create_pattern(pattern)
-            possible_words = word_index.get((length, pattern), [])
-            
-            # Store the number of options for this slot
-            slot_options.append((len(possible_words), slot))
-        
-        # Sort by number of options (fewest first)
-        slot_options.sort()
-        
-        # For slots with very few options, try more aggressive black square placement
-        for options, slot in slot_options:
-            if options > 30:  # Skip slots with plenty of options
-                continue
-                
-            row, col, direction, length = slot
-            
-            # Try placing black squares at strategic positions within the slot
-            positions_to_try = []
-            
+                for i in range(length):
+                    new_grid[row + i][col] = "#"
+        elif len(valid_words) < 3:  # Consider slots with very few options as difficult
+            difficult_slots.append((slot, len(valid_words)))
+
+    # If no impossible slots but have difficult ones, try to resolve them
+    if not impossible_slots and difficult_slots:
+        difficult_slots.sort(key=lambda x: x[1])  # Sort by number of valid words
+        slot, _ = difficult_slots[0]  # Take the most constrained slot
+        row, col, direction, length = slot
+
+        # Try filling part of the slot with black squares
+        if length > 3:  # Only try for longer words
             if direction == "across":
-                # Try positions along the slot
-                for i in range(length):
-                    positions_to_try.append((row, col + i))
+                mid = length // 2
+                new_grid[row][col + mid] = "#"
             else:
-                # Try positions along the slot
-                for i in range(length):
-                    positions_to_try.append((row + i, col))
-                    
-            # Prioritize positions that would split the slot into more manageable pieces
-            if length > 4:
-                # For longer slots, try placing black squares in the middle first
-                positions_to_try.sort(key=lambda pos: abs(pos[0] - row - length//2 if direction == "down" else abs(pos[1] - col - length//2)))
-            
-            for pos_row, pos_col in positions_to_try:
-                # Skip if already a black square
-                if new_grid[pos_row][pos_col] == "#":
-                    continue
-                    
-                # Place black square symmetrically
-                def place_symmetrically(r: int, c: int):
-                    new_grid[r][c] = "#"
-                    new_grid[height - 1 - r][width - 1 - c] = "#"
-                    
-                # Check if placing a black square would create a 2x2 block
-                def would_create_2x2_block(r: int, c: int) -> bool:
-                    # Check all four possible 2x2 configurations that include this position
-                    if (r > 0 and c > 0 and 
-                        new_grid[r-1][c] == "#" and new_grid[r][c-1] == "#" and new_grid[r-1][c-1] == "#"):
-                        return True
-                    if (r > 0 and c < width - 1 and 
-                        new_grid[r-1][c] == "#" and new_grid[r][c+1] == "#" and new_grid[r-1][c+1] == "#"):
-                        return True
-                    if (r < height - 1 and c > 0 and 
-                        new_grid[r+1][c] == "#" and new_grid[r][c-1] == "#" and new_grid[r+1][c-1] == "#"):
-                        return True
-                    if (r < height - 1 and c < width - 1 and 
-                        new_grid[r+1][c] == "#" and new_grid[r][c+1] == "#" and new_grid[r+1][c+1] == "#"):
-                        return True
-                    return False
-                
-                # Check if placing a black square would isolate any white squares
-                def would_isolate_squares(r: int, c: int) -> bool:
-                    # Check the four adjacent cells
-                    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                        nr, nc = r + dr, c + dc
-                        if 0 <= nr < height and 0 <= nc < width and new_grid[nr][nc] == ".":
-                            # Count connections for this adjacent cell
-                            connections = 0
-                            for adr, adc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                                anr, anc = nr + adr, nc + adc
-                                if 0 <= anr < height and 0 <= anc < width and (anr, anc) != (r, c) and new_grid[anr][anc] == ".":
-                                    connections += 1
-                            if connections == 0:  # This would isolate the cell
-                                return True
-                    return False
-                
-                # Check if we can place a black square here
-                if not would_create_2x2_block(pos_row, pos_col) and not would_isolate_squares(pos_row, pos_col):
-                    # Place the black square symmetrically
-                    place_symmetrically(pos_row, pos_col)
-                    modified = True
-                    break  # Only make one modification at a time
-                    
-            if modified:
-                break
-        
-        # If we modified the grid, recalculate the slots
-        if modified:
-            new_slots = find_slots(new_grid, config)
-    
-    return new_grid, new_slots
+                mid = length // 2
+                new_grid[row + mid][col] = "#"
+            impossible_slots.append(slot)
+
+    if impossible_slots:
+        remaining_slots = [s for s in slots if s not in impossible_slots]
+        return new_grid, remaining_slots
+    return grid, slots
+
+
+
+# --- Statistics Tracking ---
+class CrosswordStats:
+    """Tracks crossword generation statistics."""
+    def __init__(self):
+        self.attempts = 0
+        self.backtracks = 0
+        self.words_tried = 0
+        self.successful_placements = 0
+        self.failed_placements = 0
+        self.time_spent = 0.0
+        self.start_time = time.time()
+        self.slot_fill_order = []  # Initialize as empty list
+        self.definition_failures = 0
+        self.dynamic_beam_width = DEFAULT_BEAM_WIDTH
+        self.dynamic_max_backtrack = DEFAULT_MAX_BACKTRACK
+
+    def update_time(self):
+        self.time_spent = time.time() - self.start_time
+
+    def get_summary(self) -> str:
+        self.update_time()
+        slot_order = "\n└── Slots Filled Order: [" + ", ".join([f"({r},{c},{d})" for r,c,d in self.slot_fill_order]) + "]"
+        return (
+            "📊 Crossword Generation Stats:\n"
+            f"├── Attempts: {self.attempts}\n"
+            f"├── Backtracks: {self.backtracks}\n"
+            f"├── Words Tried: {self.words_tried}\n"
+            f"├── Successful Placements: {self.successful_placements}\n"
+            f"├── Failed Placements: {self.failed_placements}\n"
+            f"├── Definition Failures: {self.definition_failures}\n"
+            f"├── Dynamic Beam Width: {self.dynamic_beam_width}\n"
+            f"├── Dynamic Max Backtrack: {self.dynamic_max_backtrack}\n"
+            f"├── Success Rate: {self.successful_placements / max(1, self.words_tried) * 100:.2f}%\n"
+            f"├── Time Spent: {self.time_spent:.2f}s\n"
+            f"{slot_order}")
+
+# Initialize global stats object
+stats = CrosswordStats()
 
 if __name__ == "__main__":
     main()
