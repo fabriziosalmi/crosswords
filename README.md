@@ -1,5 +1,7 @@
 # Interactive Crossword Puzzle Generator
 
+> WARNING! DON'T WORK :)
+
 This Python script (`crossword.py`) generates interactive crossword puzzles in HTML format, leveraging Language Models (LLMs) for clue generation.  
 
 ## Introduction
