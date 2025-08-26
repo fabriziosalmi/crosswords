@@ -1,0 +1,42 @@
+services:
+  crossword-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - NODE_ENV=development
+      - PORT=3000
+    volumes:
+      # Enable hot reload in development
+      - .:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    command: >
+      sh -c "
+        npm install nodemon --save-dev &&
+        npx nodemon server.js
+      "
+    restart: unless-stopped
+
+  # Development tools
+  adminer:
+    image: adminer
+    ports:
+      - "8080:8080"
+    profiles:
+      - dev-tools
+
+  portainer:
+    image: portainer/portainer-ce:alpine
+    ports:
+      - "9000:9000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    restart: unless-stopped
+    profiles:
+      - dev-tools
+
+volumes:
+  portainer_data:

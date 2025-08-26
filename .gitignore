@@ -1,3 +1,67 @@
-__pycache__
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-log.txt
+
+# Node.js
+node_modules/
+npm-debug.log*
+package-lock.json
+yarn.lock
+
+# Generated HTML files (except templates and main interface)
+*.html
+!index.html
+!template.html
+
+# Temporary files
+*.tmp
+*.temp
+.cache
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
 .DS_Store
-docs/cruciverba.html
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Docker
+.env
+!.env.example
+
+# Logs
+logs/
+*.log
+
+# Backup files
+backups/
+
+# SSL certificates
+ssl/
+*.pem
+*.crt
+*.key
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Runtime data
+pids/
+*.pid
+*.seed

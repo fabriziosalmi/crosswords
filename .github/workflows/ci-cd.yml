@@ -1,0 +1,263 @@
+name: 🧩 Crossword Generator CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  release:
+    types: [ published ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Test and Build Job
+  test-and-build:
+    name: 🧪 Test & Build
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 📋 Checkout code
+      uses: actions/checkout@v4
+      
+    - name: 🐳 Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: 🏗️ Build Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: false
+        tags: crossword-generator:test
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    - name: 🧪 Test Docker container
+      run: |
+        # Start container in background
+        docker run -d --name test-container -p 3000:3000 crossword-generator:test
+        
+        # Wait for container to be ready
+        sleep 10
+        
+        # Test health endpoint
+        curl -f http://localhost:3000/health || exit 1
+        
+        # Test API info endpoint
+        curl -f http://localhost:3000/api/info || exit 1
+        
+        # Test main page
+        curl -f http://localhost:3000/ || exit 1
+        
+        # Stop container
+        docker stop test-container
+        docker rm test-container
+        
+        echo "✅ All tests passed!"
+
+  # Security Scan Job
+  security-scan:
+    name: 🔒 Security Scan
+    runs-on: ubuntu-latest
+    needs: test-and-build
+    
+    steps:
+    - name: 📋 Checkout code
+      uses: actions/checkout@v4
+      
+    - name: 🐳 Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: 🏗️ Build image for scanning
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: false
+        tags: crossword-generator:scan
+        
+    - name: 🔍 Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: 'crossword-generator:scan'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        
+    - name: 📤 Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  # Build and Push to Registry Job
+  build-and-push:
+    name: 🚀 Build & Push
+    runs-on: ubuntu-latest
+    needs: [test-and-build, security-scan]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    permissions:
+      contents: read
+      packages: write
+      
+    steps:
+    - name: 📋 Checkout code
+      uses: actions/checkout@v4
+      
+    - name: 🐳 Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: 🔑 Login to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: 🏷️ Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+          
+    - name: 🏗️ Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64,linux/arm64
+
+  # Deploy Job (example for staging/production)
+  deploy:
+    name: 🚀 Deploy
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - name: 📋 Checkout code
+      uses: actions/checkout@v4
+      
+    - name: 🔧 Setup deployment (example)
+      run: |
+        echo "🚀 Deploying to production..."
+        echo "This is where you would:"
+        echo "  - SSH to your server"
+        echo "  - Pull the new image"
+        echo "  - Update docker-compose.yml"
+        echo "  - Run: docker-compose up -d --pull always"
+        echo "  - Run health checks"
+        echo "  - Send notifications"
+        
+    # Example deployment step (uncomment and configure for your setup)
+    # - name: 🌐 Deploy to server
+    #   uses: appleboy/ssh-action@v1.0.0
+    #   with:
+    #     host: ${{ secrets.HOST }}
+    #     username: ${{ secrets.USERNAME }}
+    #     key: ${{ secrets.SSH_KEY }}
+    #     script: |
+    #       cd /path/to/crosswords
+    #       docker-compose pull
+    #       docker-compose up -d
+    #       docker-compose exec crossword-generator curl -f http://localhost:3000/health
+
+  # Performance Test Job
+  performance-test:
+    name: ⚡ Performance Test
+    runs-on: ubuntu-latest
+    needs: test-and-build
+    if: github.event_name == 'pull_request'
+    
+    steps:
+    - name: 📋 Checkout code
+      uses: actions/checkout@v4
+      
+    - name: 🐳 Start application
+      run: |
+        docker-compose up -d
+        sleep 15  # Wait for startup
+        
+    - name: 🏃‍♂️ Run basic performance tests
+      run: |
+        # Test response times
+        echo "Testing response times..."
+        
+        # Health check response time
+        time curl -s http://localhost:3000/health > /dev/null
+        
+        # Main page response time
+        time curl -s http://localhost:3000/ > /dev/null
+        
+        # API info response time
+        time curl -s http://localhost:3000/api/info > /dev/null
+        
+        echo "✅ Performance tests completed"
+        
+    - name: 🛑 Cleanup
+      if: always()
+      run: docker-compose down
+
+  # Documentation Update Job
+  update-docs:
+    name: 📚 Update Documentation
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: 📋 Checkout code
+      uses: actions/checkout@v4
+      
+    - name: 🐳 Generate API documentation
+      run: |
+        # Start application to extract API info
+        docker-compose up -d
+        sleep 10
+        
+        # Get API endpoints
+        curl -s http://localhost:3000/api/info | jq . > api-info.json
+        
+        # Generate documentation (example)
+        echo "# API Documentation" > API.md
+        echo "" >> API.md
+        echo "Generated on: $(date)" >> API.md
+        echo "" >> API.md
+        echo "## Endpoints" >> API.md
+        jq -r '.endpoints[]' api-info.json | sed 's/^/- /' >> API.md
+        echo "" >> API.md
+        echo "## Features" >> API.md
+        jq -r '.features[]' api-info.json | sed 's/^/- /' >> API.md
+        
+        docker-compose down
+        
+    - name: 💾 Commit documentation
+      uses: stefanzweifel/git-auto-commit-action@v5
+      with:
+        commit_message: '📚 Auto-update API documentation'
+        file_pattern: '*.md'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Cleanup Job
+  cleanup:
+    name: 🧹 Cleanup
+    runs-on: ubuntu-latest
+    needs: [test-and-build, security-scan, build-and-push, performance-test]
+    if: always()
+    
+    steps:
+    - name: 🧹 Cleanup Docker resources
+      run: |
+        docker system prune -f
+        echo "✅ Cleanup completed"

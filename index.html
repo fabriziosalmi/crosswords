@@ -1,29 +1,185 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="it">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Crossword Generator</title>
-    <link rel="stylesheet" href="style.css">
+    <title>Generatore di Cruciverba</title>
+    <link rel="stylesheet" href="styles.css">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 </head>
 <body>
     <div class="container">
-        <h1>Crossword Generator</h1>
-        
-        <div class="controls">
-            <button id="generateBtn">Generate New Crossword</button>
-            <button id="downloadBtn">Download PDF</button>
-        </div>
-        
-        <div class="content">
-            <div class="crossword-section">
-                <div id="crosswordContainer"></div>
+        <header class="header">
+            <div class="header-content">
+                <h1 class="main-title">
+                    <i class="fas fa-puzzle-piece"></i>
+                    Generatore di Cruciverba
+                </h1>
+                <p class="subtitle">Crea cruciverba personalizzati in italiano</p>
             </div>
-            
-            <div id="cluesContainer"></div>
+        </header>
+
+        <main class="main-content">
+            <!-- Control Panel -->
+            <div class="control-panel" id="controlPanel">
+                <div class="control-section">
+                    <h3><i class="fas fa-cogs"></i> Impostazioni</h3>
+                    
+                    <div class="control-group">
+                        <label for="gridSize">Dimensione griglia:</label>
+                        <select id="gridSize" class="control-input">
+                            <option value="10">10x10 (Facile)</option>
+                            <option value="15" selected>15x15 (Medio)</option>
+                            <option value="20">20x20 (Difficile)</option>
+                        </select>
+                    </div>
+
+                    <div class="control-group">
+                        <label for="maxWords">Numero parole:</label>
+                        <select id="maxWords" class="control-input">
+                            <option value="8">8 parole</option>
+                            <option value="12" selected>12 parole</option>
+                            <option value="16">16 parole</option>
+                            <option value="20">20 parole</option>
+                        </select>
+                    </div>
+
+                    <div class="control-group">
+                        <label for="theme">Tema:</label>
+                        <select id="theme" class="control-input">
+                            <option value="general" selected>Generale</option>
+                            <option value="animals">Animali</option>
+                            <option value="family">Famiglia</option>
+                            <option value="food">Cibo</option>
+                            <option value="nature">Natura</option>
+                        </select>
+                    </div>
+
+                    <div class="button-group">
+                        <button id="generateBtn" class="btn btn-primary">
+                            <i class="fas fa-magic"></i>
+                            Genera Cruciverba
+                        </button>
+                        <button id="resetBtn" class="btn btn-secondary">
+                            <i class="fas fa-redo"></i>
+                            Reset
+                        </button>
+                    </div>
+                </div>
+
+                <div class="control-section">
+                    <h3><i class="fas fa-gamepad"></i> Strumenti di Gioco</h3>
+                    
+                    <div class="button-group">
+                        <button id="checkBtn" class="btn btn-success">
+                            <i class="fas fa-check"></i>
+                            Verifica
+                        </button>
+                        <button id="hintBtn" class="btn btn-warning">
+                            <i class="fas fa-lightbulb"></i>
+                            Suggerimento
+                        </button>
+                        <button id="clearBtn" class="btn btn-danger">
+                            <i class="fas fa-eraser"></i>
+                            Pulisci
+                        </button>
+                    </div>
+
+                    <div class="progress-section">
+                        <label>Progresso:</label>
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="progressFill"></div>
+                        </div>
+                        <span class="progress-text" id="progressText">0%</span>
+                    </div>
+                </div>
+
+                <div class="control-section">
+                    <h3><i class="fas fa-download"></i> Esporta</h3>
+                    <div class="button-group">
+                        <button id="printBtn" class="btn btn-outline">
+                            <i class="fas fa-print"></i>
+                            Stampa
+                        </button>
+                        <button id="saveBtn" class="btn btn-outline">
+                            <i class="fas fa-save"></i>
+                            Salva HTML
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Game Area -->
+            <div class="game-area">
+                <div class="crossword-section">
+                    <div class="section-header">
+                        <h2><i class="fas fa-th"></i> Cruciverba</h2>
+                        <div class="timer" id="timer">
+                            <i class="fas fa-clock"></i>
+                            <span id="timeDisplay">00:00</span>
+                        </div>
+                    </div>
+                    
+                    <div class="crossword-container" id="crosswordContainer">
+                        <div class="empty-state">
+                            <i class="fas fa-puzzle-piece"></i>
+                            <p>Premi "Genera Cruciverba" per iniziare</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="clues-section">
+                    <div class="section-header">
+                        <h2><i class="fas fa-list"></i> Definizioni</h2>
+                        <button id="toggleClues" class="btn-icon" title="Nascondi/Mostra definizioni">
+                            <i class="fas fa-eye"></i>
+                        </button>
+                    </div>
+                    
+                    <div class="clues-container" id="cluesContainer">
+                        <div class="empty-state">
+                            <i class="fas fa-list-alt"></i>
+                            <p>Le definizioni appariranno qui</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <!-- Status Messages -->
+        <div class="status-messages" id="statusMessages"></div>
+
+        <!-- Completion Modal -->
+        <div class="modal" id="completionModal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3><i class="fas fa-trophy"></i> Complimenti!</h3>
+                    <button class="modal-close" id="modalClose">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <p>Hai completato il cruciverba!</p>
+                    <div class="stats">
+                        <div class="stat">
+                            <span class="stat-label">Tempo:</span>
+                            <span class="stat-value" id="finalTime">--:--</span>
+                        </div>
+                        <div class="stat">
+                            <span class="stat-label">Accuratezza:</span>
+                            <span class="stat-value" id="finalAccuracy">--%</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button id="newGameBtn" class="btn btn-primary">
+                        <i class="fas fa-play"></i>
+                        Nuovo Cruciverba
+                    </button>
+                </div>
+            </div>
         </div>
     </div>
-    
-    <script src="script.js"></script>
+
+    <script src="enhanced-script.js"></script>
 </body>
 </html>
