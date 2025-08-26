@@ -14,10 +14,9 @@ npm-debug.log*
 package-lock.json
 yarn.lock
 
-# Generated HTML files (except templates and main interface)
+# Generated HTML files (except main interface)
 *.html
 !index.html
-!template.html
 
 # Temporary files
 *.tmp
