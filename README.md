@@ -9,7 +9,7 @@
 
 ```bash
 # Clona il repository
-git clone https://github.com/your-username/crosswords.git
+git clone https://github.com/fabriziosalmi/crosswords.git
 cd crosswords
 
 # Avvia con Docker Compose
