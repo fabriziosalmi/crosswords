@@ -4,7 +4,7 @@
 
 ```bash
 # 1. Clona e avvia
-git clone https://github.com/your-username/crosswords.git
+git clone https://github.com/fabriziosalmi/crosswords.git
 cd crosswords
 make quick-start
 

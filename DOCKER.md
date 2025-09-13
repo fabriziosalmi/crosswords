@@ -13,7 +13,7 @@ Guida completa per l'implementazione e distribuzione del Generatore di Cruciverb
 
 ```bash
 # 1. Clona il repository
-git clone https://github.com/your-username/crosswords.git
+git clone https://github.com/fabriziosalmi/crosswords.git
 cd crosswords
 
 # 2. Avvia l'applicazione
@@ -211,7 +211,7 @@ sudo cp /etc/letsencrypt/live/yourdomain.com/privkey.pem ssl/key.pem
 ### 3. Deploy
 ```bash
 # Clone repository
-git clone https://github.com/your-username/crosswords.git
+git clone https://github.com/fabriziosalmi/crosswords.git
 cd crosswords
 
 # Configura variabili ambiente
