@@ -111,17 +111,27 @@ python3 simple_crossword.py
 make help                # Mostra tutti i comandi
 make quick-start         # Avvio rapido per nuovi utenti
 make dev                 # Ambiente di sviluppo
-make prod               # Ambiente di produzione
-make dev-tools          # Sviluppo + strumenti aggiuntivi
-make build              # Costruisce l'applicazione
-make up/down            # Avvia/ferma servizi
-make logs               # Visualizza logs
-make health             # Verifica salute applicazione
-make clean              # Pulizia container e volumi
-make shell              # Shell nel container
-make backup             # Backup dati
-make ssl                # Genera certificati SSL
-make info               # Informazioni ambiente
+make prod                # Ambiente di produzione
+make dev-tools           # Sviluppo + strumenti aggiuntivi
+make build               # Costruisce l'applicazione
+make up/down             # Avvia/ferma servizi
+make restart             # Riavvia servizi
+make logs                # Visualizza logs applicazione
+make logs-all            # Visualizza logs tutti i servizi
+make status              # Status dei servizi
+make health              # Verifica salute applicazione
+make test                # Esegue i test
+make clean               # Pulizia container e volumi
+make clean-all           # Pulizia completa (include immagini)
+make shell               # Shell nel container
+make backup              # Backup dati
+make update              # Aggiorna e riavvia servizi
+make ssl                 # Genera certificati SSL
+make info                # Informazioni ambiente
+make install             # Installa dipendenze locali
+make docker-clean        # Pulizia Docker system
+make docker-images       # Mostra immagini Docker
+make docker-containers   # Mostra container in esecuzione
 ```
 
 ## 📚 Dizionario Italiano Espanso
@@ -194,5 +204,5 @@ Contributions are welcome!  Here are some ways you can contribute:
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details. (You'll need to create a LICENSE file and put the MIT license text in it.)
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
