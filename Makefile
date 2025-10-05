@@ -71,9 +71,9 @@ clean-all: ## Clean up everything including images
 shell: ## Open shell in the application container
 	docker-compose exec crossword-generator sh
 
-test: ## Run tests (placeholder)
+test: ## Run tests
 	@echo "🧪 Running tests..."
-	docker-compose exec crossword-generator npm test || echo "⚠️ No tests configured yet"
+	docker-compose exec crossword-generator npm test || npm test
 
 # Backup and restore (for future database features)
 backup: ## Backup application data
