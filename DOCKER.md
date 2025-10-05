@@ -65,22 +65,30 @@ Servizi disponibili:
 
 ```bash
 make help                # Mostra tutti i comandi disponibili
+make quick-start         # Avvio rapido per nuovi utenti
 make dev                 # Avvia ambiente di sviluppo
-make prod               # Avvia ambiente di produzione
-make build              # Costruisce l'applicazione
-make up                 # Avvia i servizi
-make down               # Ferma i servizi
-make restart            # Riavvia i servizi
-make logs               # Mostra i logs dell'applicazione
-make logs-all           # Mostra i logs di tutti i servizi
-make status             # Mostra lo stato dei servizi
-make health             # Verifica la salute dell'applicazione
-make clean              # Pulizia container e volumi
-make clean-all          # Pulizia completa incluse immagini
-make shell              # Apre shell nel container
-make backup             # Backup dei dati
-make update             # Aggiorna e riavvia servizi
-make info               # Informazioni ambiente
+make dev-tools           # Sviluppo + strumenti aggiuntivi
+make prod                # Avvia ambiente di produzione
+make build               # Costruisce l'applicazione
+make up                  # Avvia i servizi
+make down                # Ferma i servizi
+make restart             # Riavvia i servizi
+make logs                # Mostra i logs dell'applicazione
+make logs-all            # Mostra i logs di tutti i servizi
+make status              # Mostra lo stato dei servizi
+make health              # Verifica la salute dell'applicazione
+make test                # Esegue i test
+make clean               # Pulizia container e volumi
+make clean-all           # Pulizia completa incluse immagini
+make shell               # Apre shell nel container
+make backup              # Backup dei dati
+make update              # Aggiorna e riavvia servizi
+make ssl                 # Genera certificati SSL
+make info                # Informazioni ambiente
+make install             # Installa dipendenze locali
+make docker-clean        # Pulizia Docker system
+make docker-images       # Mostra immagini Docker
+make docker-containers   # Mostra container in esecuzione
 ```
 
 ## 🏗️ Struttura Docker
